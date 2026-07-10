@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-Private Telegram bot for Falcon searches.
+Falcon Telegram Bot
 
 Commands:
-  /s <term>   -> run Falcon in ULP mode (cleaned raw hit lines), send ULP_<term>.txt
-  /c <term>   -> run Falcon in COMBO mode (user:pass only), send COMBO_LP_<term>.txt
+  /s <term>    search — ULP mode  (full cleaned hits)
+  /c <term>    search — COMBO mode (user:pass only)
+  /cancel      cancel the running search (queued jobs stay)
+  /queue       show the current job queue
+  /help        show this help
 
-Shows LIVE progress by editing a single Telegram message while Falcon runs.
-
-Config: copy env.example to .env and fill in your values. Do NOT hardcode secrets.
+Config: copy env.example to .env and fill in your values.
 """
 import os
 import re
 import time
+import queue
 import requests
 import subprocess
 import threading
 from pathlib import Path
 
-# ---------------- load .env (no external library needed) ----------------
+# ── load .env ────────────────────────────────────────────────────────────────
 def _load_env():
     env_path = Path(__file__).parent / ".env"
     if not env_path.exists():
@@ -32,7 +34,6 @@ def _load_env():
             os.environ.setdefault(key.strip(), val.strip())
 
 _load_env()
-# ------------------------------------------------------------------------
 
 def _require(key: str) -> str:
     val = os.environ.get(key, "").strip()
@@ -43,15 +44,23 @@ def _require(key: str) -> str:
         )
     return val
 
-TOKEN             = _require("TELEGRAM_BOT_TOKEN")
-ALLOWED_CHAT_IDS  = {int(x.strip()) for x in _require("ALLOWED_CHAT_IDS").split(",") if x.strip()}
-SOURCE_DIR        = os.environ.get("SOURCE_DIR", "/data/textset")
-OUT_DIR           = os.environ.get("OUT_DIR",    "/data/archives")
-PYTHON_BIN        = os.environ.get("PYTHON_BIN", "python3")
-FALCON_SCRIPT     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "falcon_parse.py")
+TOKEN            = _require("TELEGRAM_BOT_TOKEN")
+ALLOWED_CHAT_IDS = {int(x.strip()) for x in _require("ALLOWED_CHAT_IDS").split(",") if x.strip()}
+SOURCE_DIR       = os.environ.get("SOURCE_DIR", "/data/textset")
+OUT_DIR          = os.environ.get("OUT_DIR",    "/data/archives")
+PYTHON_BIN       = os.environ.get("PYTHON_BIN", "python3")
+FALCON_SCRIPT    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "falcon_parse.py")
 
 API = f"https://api.telegram.org/bot{TOKEN}"
-LAST_UPDATE_ID = 0
+
+# ── job queue & cancel state ─────────────────────────────────────────────────
+# Each item: (chat_id, term, mode)
+JOB_QUEUE    = queue.Queue()
+QUEUE_LIST   = []          # mirror list for /queue display (protected by QUEUE_LOCK)
+QUEUE_LOCK   = threading.Lock()
+CANCEL_EVENT = threading.Event()   # set to request cancel of the running job
+RUNNING_JOB  = None               # dict with info about the currently running job
+RUNNING_LOCK = threading.Lock()
 
 PROGRESS_RE = re.compile(
     r'PROGRESS phase=(\d+)\s+(?:hits=(\d+)\s+ulp=(\d+)|combos=(\d+))\s+elapsed=([\d.]+)'
@@ -60,10 +69,11 @@ DONE_RE = re.compile(
     r'DONE hits=(\d+) ulp=(\d+) combos=(\d+) elapsed=([\d.]+)'
 )
 
+LAST_UPDATE_ID = 0
 
+# ── telegram helpers ─────────────────────────────────────────────────────────
 def api_post(method, data=None, files=None):
     return requests.post(f"{API}/{method}", data=data, files=files, timeout=60)
-
 
 def send_message(chat_id, text):
     r = api_post("sendMessage", {"chat_id": chat_id, "text": text})
@@ -71,7 +81,6 @@ def send_message(chat_id, text):
         return r.json()["result"]["message_id"]
     except Exception:
         return None
-
 
 def edit_message(chat_id, message_id, text):
     try:
@@ -83,7 +92,6 @@ def edit_message(chat_id, message_id, text):
     except Exception:
         pass
 
-
 def send_document(chat_id, file_path, caption=None):
     with open(file_path, "rb") as f:
         data = {"chat_id": chat_id}
@@ -91,47 +99,63 @@ def send_document(chat_id, file_path, caption=None):
             data["caption"] = caption
         api_post("sendDocument", data=data, files={"document": f})
 
-
 def safe_term(term):
     return re.sub(r"[^\w\-\.]", "_", term)
 
-
+# ── worker ───────────────────────────────────────────────────────────────────
 def run_falcon(chat_id, term, mode):
-    """Runs falcon_parse.py, streams progress into one live-edited Telegram message,
-    then sends the resulting file."""
-    st = safe_term(term)
-    label = "ULP (full hits)" if mode == "ulp" else "COMBO (user:pass)"
-    out_file = os.path.join(OUT_DIR, f"ULP_{st}.txt" if mode == "ulp" else f"COMBO_LP_{st}.txt")
+    """Execute one Falcon job. Called by the queue worker thread."""
+    global RUNNING_JOB
 
-    msg_id = send_message(chat_id, f"\U0001f50e Searching '{term}' \u2014 mode: {label}\nStarting...")
+    st    = safe_term(term)
+    label = "ULP (full hits)" if mode == "ulp" else "COMBO (user:pass)"
+    out_file = os.path.join(OUT_DIR,
+        f"ULP_{st}.txt" if mode == "ulp" else f"COMBO_LP_{st}.txt")
+
+    with RUNNING_LOCK:
+        RUNNING_JOB = {"chat_id": chat_id, "term": term, "mode": mode}
+    CANCEL_EVENT.clear()
+
+    msg_id = send_message(chat_id,
+        f"\U0001f50e Searching '{term}' \u2014 {label}\nStarting...")
     if msg_id is None:
+        with RUNNING_LOCK:
+            RUNNING_JOB = None
         return
 
-    cmd = [PYTHON_BIN, FALCON_SCRIPT, "--term", term, "--source", SOURCE_DIR,
+    cmd = [PYTHON_BIN, FALCON_SCRIPT,
+           "--term", term, "--source", SOURCE_DIR,
            "--out", OUT_DIR, "--mode", mode]
 
-    t0 = time.time()
-    last_edit = 0
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             bufsize=1, text=True, errors="ignore")
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        bufsize=1, text=True, errors="ignore")
 
     last_text = ""
+    last_edit  = 0
+    cancelled  = False
+
     try:
         for line in proc.stdout:
-            line = line.strip()
-            now = time.time()
+            # ── check cancel ──
+            if CANCEL_EVENT.is_set():
+                proc.kill()
+                cancelled = True
+                break
 
-            m = PROGRESS_RE.search(line)
-            d = DONE_RE.search(line)
+            line = line.strip()
+            now  = time.time()
+            m    = PROGRESS_RE.search(line)
+            d    = DONE_RE.search(line)
 
             if m:
-                phase = m.group(1)
+                phase   = m.group(1)
                 elapsed = m.group(5)
                 if phase == "1":
                     hits, ulp = m.group(2), m.group(3)
                     text = (f"\U0001f50e Searching '{term}' \u2014 {label}\n"
                             f"Phase 1: scanning\n"
-                            f"Hits: {hits}\nUnique cleaned: {ulp}\n"
+                            f"Hits: {hits}  |  Unique: {ulp}\n"
                             f"Elapsed: {elapsed}s")
                 else:
                     combos = m.group(4)
@@ -143,62 +167,169 @@ def run_falcon(chat_id, term, mode):
                     edit_message(chat_id, msg_id, text)
                     last_edit = now
                     last_text = text
+
             elif d:
                 hits, ulp, combos, elapsed = d.groups()
-                text = (f"\u2705 Done searching '{term}'\n"
-                        f"Raw hits: {hits}\nUnique ULP: {ulp}\nUnique combos: {combos}\n"
-                        f"Total time: {elapsed}s\nUploading file...")
+                text = (f"\u2705 Done '{term}'\n"
+                        f"Raw hits: {hits}  |  ULP: {ulp}  |  Combos: {combos}\n"
+                        f"Time: {elapsed}s\nUploading...")
                 edit_message(chat_id, msg_id, text)
+
         proc.wait()
     except Exception as e:
-        edit_message(chat_id, msg_id, f"\u274c Error while running search: {e}")
+        edit_message(chat_id, msg_id, f"\u274c Error: {e}")
+        with RUNNING_LOCK:
+            RUNNING_JOB = None
+        return
+    finally:
+        with RUNNING_LOCK:
+            RUNNING_JOB = None
+
+    if cancelled:
+        edit_message(chat_id, msg_id,
+            f"\u26d4 Search for '{term}' was cancelled.")
         return
 
     if proc.returncode != 0:
-        edit_message(chat_id, msg_id, f"\u274c Falcon exited with error code {proc.returncode}")
+        edit_message(chat_id, msg_id,
+            f"\u274c Falcon exited with code {proc.returncode}")
         return
 
     if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
-        edit_message(chat_id, msg_id, f"\u26a0\ufe0f No results found for '{term}' ({label}).")
+        edit_message(chat_id, msg_id,
+            f"\u26a0\ufe0f No results for '{term}' ({label}).")
         return
 
     try:
-        send_document(chat_id, out_file, caption=f"{label} results for: {term}")
-        edit_message(chat_id, msg_id, f"\u2705 Done. Results for '{term}' sent below \u2b07\ufe0f")
+        send_document(chat_id, out_file,
+            caption=f"{label} results for: {term}")
+        edit_message(chat_id, msg_id,
+            f"\u2705 Done. '{term}' results sent \u2b07\ufe0f")
     except Exception as e:
-        edit_message(chat_id, msg_id, f"\u274c Search finished but upload failed: {e}")
+        edit_message(chat_id, msg_id,
+            f"\u274c Upload failed: {e}")
+
+
+def queue_worker():
+    """Single background thread — pulls jobs one at a time from JOB_QUEUE."""
+    while True:
+        chat_id, term, mode = JOB_QUEUE.get()
+        # remove from mirror list
+        with QUEUE_LOCK:
+            if (chat_id, term, mode) in QUEUE_LIST:
+                QUEUE_LIST.remove((chat_id, term, mode))
+        try:
+            run_falcon(chat_id, term, mode)
+        except Exception as e:
+            print(f"[queue_worker] unhandled error: {e}")
+        finally:
+            JOB_QUEUE.task_done()
+
+
+# ── command handling ─────────────────────────────────────────────────────────
+def enqueue(chat_id, term, mode):
+    with QUEUE_LOCK:
+        position = len(QUEUE_LIST) + 1
+        QUEUE_LIST.append((chat_id, term, mode))
+    JOB_QUEUE.put((chat_id, term, mode))
+
+    # tell user where they are
+    with RUNNING_LOCK:
+        busy = RUNNING_JOB is not None
+    if busy:
+        send_message(chat_id,
+            f"\U0001f4cb Queued: '{term}' (position {position})\n"
+            f"A search is already running. Yours starts when it finishes.\n"
+            f"Use /cancel to cancel the RUNNING job, or /queue to see the list.")
+    else:
+        send_message(chat_id,
+            f"\U0001f50e Starting '{term}'...")
+
+
+def cmd_cancel(chat_id):
+    with RUNNING_LOCK:
+        job = RUNNING_JOB
+    if job is None:
+        send_message(chat_id, "\u2139\ufe0f No search is running right now.")
+        return
+    CANCEL_EVENT.set()
+    send_message(chat_id,
+        f"\u23f9 Cancelling '{job['term']}' \u2014 please wait...")
+
+
+def cmd_queue(chat_id):
+    with RUNNING_LOCK:
+        job = RUNNING_JOB
+    with QUEUE_LOCK:
+        pending = list(QUEUE_LIST)
+
+    lines = []
+    if job:
+        label = "ULP" if job["mode"] == "ulp" else "COMBO"
+        lines.append(f"\U0001f7e2 Running : [{label}] {job['term']}")
+    else:
+        lines.append("\u26aa Idle")
+
+    if pending:
+        lines.append(f"\U0001f4cb Queue ({len(pending)}):")
+        for i, (_, t, m) in enumerate(pending, 1):
+            lbl = "ULP" if m == "ulp" else "COMBO"
+            lines.append(f"  {i}. [{lbl}] {t}")
+    else:
+        lines.append("\U0001f4cb Queue: empty")
+
+    send_message(chat_id, "\n".join(lines))
 
 
 def handle_command(chat_id, text):
     text = text.strip()
+
     if text.startswith("/s "):
         term = text[3:].strip()
         if not term:
-            send_message(chat_id, "Usage: /s website.com")
+            send_message(chat_id, "Usage: /s <term>")
             return
-        threading.Thread(target=run_falcon, args=(chat_id, term, "ulp"), daemon=True).start()
+        enqueue(chat_id, term, "ulp")
+
     elif text.startswith("/c "):
         term = text[3:].strip()
         if not term:
-            send_message(chat_id, "Usage: /c website.com")
+            send_message(chat_id, "Usage: /c <term>")
             return
-        threading.Thread(target=run_falcon, args=(chat_id, term, "combo"), daemon=True).start()
-    elif text.strip() in ("/start", "/help"):
+        enqueue(chat_id, term, "combo")
+
+    elif text == "/cancel":
+        cmd_cancel(chat_id)
+
+    elif text == "/queue":
+        cmd_queue(chat_id)
+
+    elif text in ("/start", "/help"):
         send_message(chat_id,
-            "Commands:\n"
-            "/s <term>  -> full cleaned hits (ULP)\n"
-            "/c <term>  -> user:pass combos only (COMBO)")
+            "\U0001f985 Falcon Bot\n"
+            "\n"
+            "/s <term>   \u2014 search, return ULP (full hits)\n"
+            "/c <term>   \u2014 search, return COMBO (user:pass)\n"
+            "/cancel     \u2014 cancel the currently running search\n"
+            "/queue      \u2014 show running job + pending queue\n"
+            "/help       \u2014 this message")
 
 
+# ── main polling loop ────────────────────────────────────────────────────────
 def main():
     global LAST_UPDATE_ID
+
+    # start the single queue worker thread
+    t = threading.Thread(target=queue_worker, daemon=True)
+    t.start()
+
     print(f"Bot started. Polling... (source={SOURCE_DIR}, out={OUT_DIR})")
     while True:
         try:
             r = requests.get(f"{API}/getUpdates", params={
                 "offset": LAST_UPDATE_ID + 1,
                 "timeout": 30,
-                "allowed_updates": '["message"]'
+                "allowed_updates": '["message"]',
             }, timeout=40).json()
         except Exception as e:
             print(f"getUpdates error: {e}")
@@ -208,10 +339,9 @@ def main():
         if r.get("ok"):
             for upd in r["result"]:
                 LAST_UPDATE_ID = upd["update_id"]
-                msg = upd.get("message", {})
+                msg     = upd.get("message", {})
                 chat_id = msg.get("chat", {}).get("id")
-                text = msg.get("text", "")
-
+                text    = msg.get("text", "")
                 if chat_id not in ALLOWED_CHAT_IDS:
                     continue
                 if text:

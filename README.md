@@ -1,21 +1,22 @@
 # falcon-tg
 
-A private Telegram bot that runs **Falcon** (a fast credential-extraction engine) on a large local dataset and sends you results directly in Telegram — with live progress updates.
+A private Telegram bot that runs **Falcon** (fast credential-extraction engine) on a local dataset and delivers results directly in Telegram — with live progress, a job queue, and cancel support.
 
 ---
 
-## Features
+## Commands
 
-- `/s <term>` — search and return full cleaned hits (ULP format)
-- `/c <term>` — search and return `user:pass` combos only
-- Live progress edited into a single message as Falcon runs
-- Whitelisted chat IDs — only you can use it
-- Runs as a systemd service (auto-restart on crash/reboot)
-- Config loaded from `.env` — no secrets in code
+| Command | Description |
+|---|---|
+| `/s <term>` | Search and return full cleaned hits (ULP format) |
+| `/c <term>` | Search and return `user:pass` combos only |
+| `/cancel` | Cancel the currently running search |
+| `/queue` | Show running job + pending queue |
+| `/help` | Show command list |
 
 ---
 
-## Quick Deploy (Linux / Ubuntu)
+## First-time Deploy (fresh server)
 
 ```bash
 git clone https://github.com/ayoubharraby/falcon-tg.git
@@ -26,19 +27,35 @@ bash setup.sh
 `setup.sh` will:
 1. Install system packages (`python3`, `ripgrep`, etc.)
 2. Create `/data/textset` and `/data/archives`
-3. Set up a Python virtualenv and install deps
-4. Ask you for your **bot token** and **Telegram user ID**, save them to `.env`
-5. Install and start the systemd service automatically
+3. Set up Python virtualenv + install deps
+4. Ask for your **bot token** and **Telegram user ID**, write them to `.env`
+5. Install and start the systemd service
+
+---
+
+## Updating the bot
+
+Whenever you push new code to GitHub, update your server in **one command**:
+
+```bash
+bash ~/falcon-tg/update.sh
+```
+
+This will:
+1. `git pull` latest code from `origin/main`
+2. Re-install any new/updated dependencies
+3. `systemctl restart` the service (graceful shutdown → fresh start)
+4. Print the service status and last 20 log lines
 
 ---
 
 ## Manual Setup
 
-If you prefer to do it manually, see [SERVER_DEPLOY.md](SERVER_DEPLOY.md).
+See [SERVER_DEPLOY.md](SERVER_DEPLOY.md) for a step-by-step manual guide.
 
 ---
 
-## Configuration
+## Configuration (`.env`)
 
 All config lives in `.env` (copied from `env.example`):
 
@@ -57,23 +74,35 @@ Get your user ID by messaging [@userinfobot](https://t.me/userinfobot).
 
 ## Dataset
 
-Place your text files inside `/data/textset/`.  
-Falcon will use `ripgrep` (if installed) or fall back to pure-Python scanning.
+Place your `.txt` files inside `/data/textset/`.  
+Falcon uses `ripgrep` if installed (much faster), otherwise falls back to pure-Python.
 
 ---
 
 ## Service Management
 
 ```bash
-# View live logs
+# Live logs
 sudo journalctl -u tg-private-bot -f
 
-# Restart after code changes
+# Restart after manual changes to bot.py or .env
 sudo systemctl restart tg-private-bot
 
 # Stop
 sudo systemctl stop tg-private-bot
+
+# Check status
+sudo systemctl status tg-private-bot
 ```
+
+---
+
+## Queue Behavior
+
+- Only **one search runs at a time**.
+- Additional `/s` or `/c` commands are queued in order and run automatically when the current job finishes.
+- `/cancel` kills only the **running** job; queued jobs remain and continue processing.
+- `/queue` shows both the running job and the full pending list.
 
 ---
 
@@ -81,4 +110,4 @@ sudo systemctl stop tg-private-bot
 
 - Ubuntu / Debian Linux
 - Python 3.8+
-- `ripgrep` (optional but strongly recommended)
+- `ripgrep` (optional but strongly recommended: `sudo apt install ripgrep`)
