@@ -1,19 +1,16 @@
 [Unit]
-Description=TG Private Bot (Falcon Telegram integration)
+Description=Falcon Telegram Bot
 After=network.target
 
 [Service]
-User=youruser
-WorkingDirectory=/home/youruser/falcon-telegram-bot
-ExecStart=/home/youruser/falcon-telegram-bot/venv/bin/python /home/youruser/falcon-telegram-bot/bot.py
+User=%i
+WorkingDirectory=/home/%i/falcon-tg
+ExecStart=/home/%i/falcon-tg/venv/bin/python /home/%i/falcon-tg/bot.py
+EnvironmentFile=/home/%i/falcon-tg/.env
 Restart=always
 RestartSec=5
-
-# Optional: environment variables (if you move secrets out of bot.py)
-# Environment="TELEGRAM_BOT_TOKEN=your-bot-token"
-# Environment="ALLOWED_CHAT_ID=7003173372"
-# Environment="SOURCE_DIR=/data/textset"
-# Environment="OUT_DIR=/data/archives"
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

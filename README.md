@@ -1,112 +1,84 @@
-# Falcon Telegram Bot
+# falcon-tg
 
-This package contains the supporting files needed to deploy and maintain the Falcon Telegram bot project.
+A private Telegram bot that runs **Falcon** (a fast credential-extraction engine) on a large local dataset and sends you results directly in Telegram — with live progress updates.
 
-## What the project is
+---
 
-The project has two main parts:
+## Features
 
-1. **Falcon** (`falcon_parse.py`) — the Python parser/processing engine that searches source data and writes cleaned result files.
-2. **Telegram bot** (`bot.py`) — the wrapper that receives Telegram commands, runs Falcon, and sends result files back through Telegram.
+- `/s <term>` — search and return full cleaned hits (ULP format)
+- `/c <term>` — search and return `user:pass` combos only
+- Live progress edited into a single message as Falcon runs
+- Whitelisted chat IDs — only you can use it
+- Runs as a systemd service (auto-restart on crash/reboot)
+- Config loaded from `.env` — no secrets in code
 
-In short:
+---
 
-- Falcon does the real processing work.
-- The bot is the interface layer.
-- The systemd service keeps the bot always running.
-
-## Included support files
-
-This handoff package is meant to sit alongside your existing code files:
-
-- `requirements.txt`
-- `README.md`
-- `SERVER_DEPLOY.md`
-- `tg-private-bot.service`
-- `.env.example`
-
-Your actual application code files are:
-
-- `falcon_parse.py`
-- `bot.py`
-
-If those two files already exist on the server and are the correct latest versions, you do **not** need new copies just to deploy or re-run the bot.
-
-## When you do need the Python files again
-
-You should include fresh copies of `falcon_parse.py` and `bot.py` when:
-
-- you are handing the project to another person,
-- you are moving it to another server,
-- you want a complete archive backup,
-- or the server copy may no longer be trusted as the latest version.
-
-If the current server already has the correct working versions, then the support files in this package are enough for documentation and deployment.
-
-## Python dependency
-
-Install dependencies with:
+## Quick Deploy (Linux / Ubuntu)
 
 ```bash
-pip install -r requirements.txt
+git clone https://github.com/ayoubharraby/falcon-tg.git
+cd falcon-tg
+bash setup.sh
 ```
 
-At the moment, the bot requires:
+`setup.sh` will:
+1. Install system packages (`python3`, `ripgrep`, etc.)
+2. Create `/data/textset` and `/data/archives`
+3. Set up a Python virtualenv and install deps
+4. Ask you for your **bot token** and **Telegram user ID**, save them to `.env`
+5. Install and start the systemd service automatically
 
-- `requests` — used by `bot.py` to communicate with the Telegram Bot API.
+---
 
-## Recommended full project layout
+## Manual Setup
 
-```text
-falcon-telegram-bot/
-  falcon_parse.py
-  bot.py
-  requirements.txt
-  README.md
-  SERVER_DEPLOY.md
-  tg-private-bot.service
-  .env.example
+If you prefer to do it manually, see [SERVER_DEPLOY.md](SERVER_DEPLOY.md).
+
+---
+
+## Configuration
+
+All config lives in `.env` (copied from `env.example`):
+
+```env
+TELEGRAM_BOT_TOKEN=your-token-here
+ALLOWED_CHAT_IDS=your-telegram-user-id
+SOURCE_DIR=/data/textset
+OUT_DIR=/data/archives
+PYTHON_BIN=python3
 ```
 
-## Run locally (basic)
+Get your bot token from [@BotFather](https://t.me/BotFather).  
+Get your user ID by messaging [@userinfobot](https://t.me/userinfobot).
+
+---
+
+## Dataset
+
+Place your text files inside `/data/textset/`.  
+Falcon will use `ripgrep` (if installed) or fall back to pure-Python scanning.
+
+---
+
+## Service Management
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-python3 bot.py
+# View live logs
+sudo journalctl -u tg-private-bot -f
+
+# Restart after code changes
+sudo systemctl restart tg-private-bot
+
+# Stop
+sudo systemctl stop tg-private-bot
 ```
 
-## Server deployment
+---
 
-Use the step-by-step file:
+## Requirements
 
-- `SERVER_DEPLOY.md`
-
-It explains:
-
-- path creation,
-- Python setup,
-- data directory setup,
-- bot configuration,
-- systemd service install,
-- auto-restart and reboot persistence.
-
-## systemd service
-
-The included service file is:
-
-- `tg-private-bot.service`
-
-After copying it to `/etc/systemd/system/`, you can enable and start it with:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable tg-private-bot.service
-sudo systemctl start tg-private-bot.service
-sudo systemctl status tg-private-bot.service
-```
-
-## Environment example
-
-The file `.env.example` is included only as a template. It shows what values should exist if you later move configuration out of `bot.py`.
+- Ubuntu / Debian Linux
+- Python 3.8+
+- `ripgrep` (optional but strongly recommended)

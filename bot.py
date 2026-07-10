@@ -8,7 +8,7 @@ Commands:
 
 Shows LIVE progress by editing a single Telegram message while Falcon runs.
 
-Config: edit the constants below before running.
+Config: copy env.example to .env and fill in your values. Do NOT hardcode secrets.
 """
 import os
 import re
@@ -16,16 +16,39 @@ import time
 import requests
 import subprocess
 import threading
-from datetime import datetime
+from pathlib import Path
 
-# ---------------- CONFIG ----------------
-TOKEN = "YOUR_BOT_TOKEN"
-ALLOWED_CHAT_IDS = {123456789}   # your Telegram user id(s) only
-SOURCE_DIR = "/data/textset"     # the big dataset directory to search
-OUT_DIR = "/data/archives"       # where Falcon writes result files
-FALCON_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "falcon_parse.py")
-PYTHON_BIN = "python3"
-# -----------------------------------------
+# ---------------- load .env (no external library needed) ----------------
+def _load_env():
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            os.environ.setdefault(key.strip(), val.strip())
+
+_load_env()
+# ------------------------------------------------------------------------
+
+def _require(key: str) -> str:
+    val = os.environ.get(key, "").strip()
+    if not val:
+        raise SystemExit(
+            f"[ERROR] Required env var '{key}' is not set.\n"
+            "Copy env.example to .env and fill in your values."
+        )
+    return val
+
+TOKEN             = _require("TELEGRAM_BOT_TOKEN")
+ALLOWED_CHAT_IDS  = {int(x.strip()) for x in _require("ALLOWED_CHAT_IDS").split(",") if x.strip()}
+SOURCE_DIR        = os.environ.get("SOURCE_DIR", "/data/textset")
+OUT_DIR           = os.environ.get("OUT_DIR",    "/data/archives")
+PYTHON_BIN        = os.environ.get("PYTHON_BIN", "python3")
+FALCON_SCRIPT     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "falcon_parse.py")
 
 API = f"https://api.telegram.org/bot{TOKEN}"
 LAST_UPDATE_ID = 0
@@ -80,7 +103,7 @@ def run_falcon(chat_id, term, mode):
     label = "ULP (full hits)" if mode == "ulp" else "COMBO (user:pass)"
     out_file = os.path.join(OUT_DIR, f"ULP_{st}.txt" if mode == "ulp" else f"COMBO_LP_{st}.txt")
 
-    msg_id = send_message(chat_id, f"🔎 Searching '{term}' — mode: {label}\nStarting...")
+    msg_id = send_message(chat_id, f"\U0001f50e Searching '{term}' \u2014 mode: {label}\nStarting...")
     if msg_id is None:
         return
 
@@ -106,13 +129,13 @@ def run_falcon(chat_id, term, mode):
                 elapsed = m.group(5)
                 if phase == "1":
                     hits, ulp = m.group(2), m.group(3)
-                    text = (f"🔎 Searching '{term}' — {label}\n"
+                    text = (f"\U0001f50e Searching '{term}' \u2014 {label}\n"
                             f"Phase 1: scanning\n"
                             f"Hits: {hits}\nUnique cleaned: {ulp}\n"
                             f"Elapsed: {elapsed}s")
                 else:
                     combos = m.group(4)
-                    text = (f"🔎 Searching '{term}' — {label}\n"
+                    text = (f"\U0001f50e Searching '{term}' \u2014 {label}\n"
                             f"Phase 2: extracting combos\n"
                             f"Combos: {combos}\n"
                             f"Elapsed: {elapsed}s")
@@ -122,28 +145,28 @@ def run_falcon(chat_id, term, mode):
                     last_text = text
             elif d:
                 hits, ulp, combos, elapsed = d.groups()
-                text = (f"✅ Done searching '{term}'\n"
+                text = (f"\u2705 Done searching '{term}'\n"
                         f"Raw hits: {hits}\nUnique ULP: {ulp}\nUnique combos: {combos}\n"
                         f"Total time: {elapsed}s\nUploading file...")
                 edit_message(chat_id, msg_id, text)
         proc.wait()
     except Exception as e:
-        edit_message(chat_id, msg_id, f"❌ Error while running search: {e}")
+        edit_message(chat_id, msg_id, f"\u274c Error while running search: {e}")
         return
 
     if proc.returncode != 0:
-        edit_message(chat_id, msg_id, f"❌ Falcon exited with error code {proc.returncode}")
+        edit_message(chat_id, msg_id, f"\u274c Falcon exited with error code {proc.returncode}")
         return
 
     if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
-        edit_message(chat_id, msg_id, f"⚠️ No results found for '{term}' ({label}).")
+        edit_message(chat_id, msg_id, f"\u26a0\ufe0f No results found for '{term}' ({label}).")
         return
 
     try:
         send_document(chat_id, out_file, caption=f"{label} results for: {term}")
-        edit_message(chat_id, msg_id, f"✅ Done. Results for '{term}' sent below ⬇️")
+        edit_message(chat_id, msg_id, f"\u2705 Done. Results for '{term}' sent below \u2b07\ufe0f")
     except Exception as e:
-        edit_message(chat_id, msg_id, f"❌ Search finished but upload failed: {e}")
+        edit_message(chat_id, msg_id, f"\u274c Search finished but upload failed: {e}")
 
 
 def handle_command(chat_id, text):
@@ -169,7 +192,7 @@ def handle_command(chat_id, text):
 
 def main():
     global LAST_UPDATE_ID
-    print("Bot started. Polling...")
+    print(f"Bot started. Polling... (source={SOURCE_DIR}, out={OUT_DIR})")
     while True:
         try:
             r = requests.get(f"{API}/getUpdates", params={
