@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
-# update.sh — pull latest code and restart the bot service.
+# update.sh — pull latest code and restart the bot.
+#
 # Usage (from anywhere on the server):
 #   bash ~/falcon-tg/update.sh
-#
-# What it does:
-#   1. git pull latest changes from origin/main
-#   2. activate venv and pip install any new/updated deps
-#   3. systemctl restart the service
-#   4. show live status + last 20 log lines
 set -euo pipefail
 
 SERVICE="tg-private-bot"
@@ -22,7 +17,17 @@ echo ""
 cd "$PROJECT_DIR"
 
 echo "[1/4] Pulling latest code..."
-git pull origin main
+# abort if there are uncommitted local changes that would block the pull
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "[WARN] You have local uncommitted changes. Stashing them first..."
+    git stash
+fi
+if ! git pull origin main; then
+    echo ""
+    echo "[ERROR] git pull failed. Possible merge conflict."
+    echo "        Run 'git status' to inspect, fix manually, then retry."
+    exit 1
+fi
 
 echo ""
 echo "[2/4] Installing / upgrading dependencies..."

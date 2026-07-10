@@ -7,6 +7,8 @@ Commands:
   /c <term>    search — COMBO mode (user:pass only)
   /cancel      cancel the running search (queued jobs stay)
   /queue       show the current job queue
+  /status      show server disk usage + saved result files
+  /clean       delete all saved result files from OUT_DIR
   /help        show this help
 
 Config: copy env.example to .env and fill in your values.
@@ -35,7 +37,7 @@ def _load_env():
 
 _load_env()
 
-def _require(key: str) -> str:
+def _require(key):
     val = os.environ.get(key, "").strip()
     if not val:
         raise SystemExit(
@@ -51,8 +53,17 @@ OUT_DIR          = os.environ.get("OUT_DIR",    "/data/archives")
 PYTHON_BIN       = os.environ.get("PYTHON_BIN", "python3")
 FALCON_SCRIPT    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "falcon_parse.py")
 
-API            = f"https://api.telegram.org/bot{TOKEN}"
-TG_MAX_BYTES   = 45 * 1024 * 1024   # 45 MB — safe margin under Telegram's 50 MB bot limit
+API          = f"https://api.telegram.org/bot{TOKEN}"
+TG_MAX_BYTES = 45 * 1024 * 1024  # 45 MB safe margin under Telegram's 50 MB bot limit
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+def _fmt_bytes(n):
+    """Human-readable file size."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
 
 # ── job queue & cancel state ──────────────────────────────────────────────────
 JOB_QUEUE    = queue.Queue()
@@ -67,6 +78,7 @@ PROGRESS_RE = re.compile(
 )
 DONE_RE = re.compile(
     r'DONE hits=(\d+) ulp=(\d+) combos=(\d+) elapsed=([\d.]+)'
+    r'(?:\s+ulp_bytes=(\d+))?(?:\s+combo_bytes=(\d+))?'
 )
 
 LAST_UPDATE_ID = 0
@@ -93,7 +105,6 @@ def edit_message(chat_id, message_id, text):
         pass
 
 def _send_one_document(chat_id, file_path, caption=None):
-    """Send a single file. Returns (ok: bool, error_description: str)."""
     try:
         with open(file_path, "rb") as f:
             data = {"chat_id": chat_id}
@@ -110,11 +121,6 @@ def _send_one_document(chat_id, file_path, caption=None):
         return False, str(e)
 
 def _split_and_send(chat_id, file_path, caption, msg_id):
-    """
-    Split file_path into <=45 MB chunks, send each as a separate document.
-    Updates the progress message as it uploads each part.
-    Returns True if all parts sent successfully.
-    """
     file_size   = os.path.getsize(file_path)
     stem        = Path(file_path).stem
     ext         = Path(file_path).suffix
@@ -123,8 +129,7 @@ def _split_and_send(chat_id, file_path, caption, msg_id):
     part_paths  = []
 
     edit_message(chat_id, msg_id,
-        f"\u2702\ufe0f File is {file_size / 1024 / 1024:.1f} MB — "
-        f"splitting into {total_parts} parts...")
+        f"\u2702\ufe0f File is {_fmt_bytes(file_size)} — splitting into {total_parts} parts...")
 
     try:
         with open(file_path, "rb") as src:
@@ -139,12 +144,10 @@ def _split_and_send(chat_id, file_path, caption, msg_id):
 
     all_ok = True
     for i, part in enumerate(part_paths, 1):
-        part_size = os.path.getsize(part) / 1024 / 1024
         edit_message(chat_id, msg_id,
-            f"\u2b06\ufe0f Uploading part {i}/{total_parts} "
-            f"({part_size:.1f} MB)...")
-        part_caption = f"{caption} — part {i}/{total_parts}"
-        ok, err = _send_one_document(chat_id, str(part), caption=part_caption)
+            f"\u2b06\ufe0f Uploading part {i}/{total_parts} ({_fmt_bytes(os.path.getsize(part))})...")
+        ok, err = _send_one_document(chat_id, str(part),
+                                     caption=f"{caption} — part {i}/{total_parts}")
         if not ok:
             edit_message(chat_id, msg_id,
                 f"\u274c Upload failed on part {i}/{total_parts}: {err}")
@@ -159,45 +162,28 @@ def _split_and_send(chat_id, file_path, caption, msg_id):
 
     return all_ok
 
-
 def deliver_file(chat_id, file_path, label, term, msg_id):
-    """
-    Smart delivery: send directly if <=45 MB, auto-split if larger.
-    Updates msg_id with status throughout.
-    """
     file_size = os.path.getsize(file_path)
     caption   = f"{label} results for: {term}"
 
     if file_size <= TG_MAX_BYTES:
         edit_message(chat_id, msg_id,
-            f"\u2b06\ufe0f Uploading ({file_size / 1024 / 1024:.1f} MB)...")
+            f"\u2b06\ufe0f Uploading ({_fmt_bytes(file_size)})...")
         ok, err = _send_one_document(chat_id, file_path, caption=caption)
-        if ok:
+        if not ok:
             edit_message(chat_id, msg_id,
-                f"\u2705 Done. '{term}' results sent \u2b07\ufe0f")
-        else:
-            edit_message(chat_id, msg_id,
-                f"\u274c Upload failed: {err}\n"
-                f"File saved on server at:\n{file_path}")
+                f"\u274c Upload failed: {err}\nFile saved on server at:\n{file_path}")
     else:
         ok = _split_and_send(chat_id, file_path, caption, msg_id)
-        if ok:
-            total_parts = (file_size + TG_MAX_BYTES - 1) // TG_MAX_BYTES
+        if not ok:
             edit_message(chat_id, msg_id,
-                f"\u2705 Done. '{term}' results sent in {total_parts} parts \u2b07\ufe0f\n"
-                f"Total size: {file_size / 1024 / 1024:.1f} MB")
-        else:
-            edit_message(chat_id, msg_id,
-                f"\u274c Partial upload failure.\n"
-                f"Full file saved on server at:\n{file_path}")
-
+                f"\u274c Partial upload failure.\nFull file on server at:\n{file_path}")
 
 def safe_term(term):
     return re.sub(r"[^\w\-\.]", "_", term)
 
 # ── worker ────────────────────────────────────────────────────────────────────
 def run_falcon(chat_id, term, mode):
-    """Execute one Falcon job. Called by the queue worker thread."""
     global RUNNING_JOB
 
     st       = safe_term(term)
@@ -224,9 +210,10 @@ def run_falcon(chat_id, term, mode):
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         bufsize=1, text=True, errors="ignore")
 
-    last_text = ""
+    last_text  = ""
     last_edit  = 0
     cancelled  = False
+    done_stats = None  # will hold parsed DONE line data
 
     try:
         for line in proc.stdout:
@@ -246,25 +233,32 @@ def run_falcon(chat_id, term, mode):
                 if phase == "1":
                     hits, ulp = m.group(2), m.group(3)
                     text = (f"\U0001f50e Searching '{term}' — {label}\n"
-                            f"Phase 1: scanning\n"
-                            f"Hits: {hits}  |  Unique: {ulp}\n"
-                            f"Elapsed: {elapsed}s")
+                            f"Phase 1 — scanning\n"
+                            f"Raw hits : {int(hits):,}\n"
+                            f"Unique   : {int(ulp):,}\n"
+                            f"Elapsed  : {elapsed}s")
                 else:
                     combos = m.group(4)
                     text = (f"\U0001f50e Searching '{term}' — {label}\n"
-                            f"Phase 2: extracting combos\n"
-                            f"Combos: {combos}\n"
-                            f"Elapsed: {elapsed}s")
+                            f"Phase 2 — extracting combos\n"
+                            f"Combos so far : {int(combos):,}\n"
+                            f"Elapsed       : {elapsed}s")
                 if now - last_edit >= 2.0 and text != last_text:
                     edit_message(chat_id, msg_id, text)
                     last_edit = now
                     last_text = text
 
             elif d:
-                hits, ulp, combos, elapsed = d.groups()
-                text = (f"\u2705 Done '{term}'\n"
-                        f"Raw hits: {hits}  |  ULP: {ulp}  |  Combos: {combos}\n"
-                        f"Time: {elapsed}s\nPreparing upload...")
+                hits, ulp, combos, elapsed = d.group(1), d.group(2), d.group(3), d.group(4)
+                ulp_bytes   = int(d.group(5) or 0)
+                combo_bytes = int(d.group(6) or 0)
+                done_stats  = (hits, ulp, combos, elapsed, ulp_bytes, combo_bytes)
+                text = (f"\U0001f4ca Done '{term}'\n"
+                        f"Raw hits : {int(hits):,}\n"
+                        f"ULP      : {int(ulp):,}\n"
+                        f"Combos   : {int(combos):,}\n"
+                        f"Time     : {elapsed}s\n"
+                        f"Preparing upload...")
                 edit_message(chat_id, msg_id, text)
 
         proc.wait()
@@ -278,8 +272,7 @@ def run_falcon(chat_id, term, mode):
             RUNNING_JOB = None
 
     if cancelled:
-        edit_message(chat_id, msg_id,
-            f"\u26d4 Search for '{term}' was cancelled.")
+        edit_message(chat_id, msg_id, f"\u26d4 Search for '{term}' was cancelled.")
         return
 
     if proc.returncode != 0:
@@ -292,11 +285,33 @@ def run_falcon(chat_id, term, mode):
             f"\u26a0\ufe0f No results for '{term}' ({label}).")
         return
 
+    # deliver file
     deliver_file(chat_id, out_file, label, term, msg_id)
+
+    # final technical summary after upload
+    if done_stats:
+        hits, ulp, combos, elapsed, ulp_bytes, combo_bytes = done_stats
+        file_size = os.path.getsize(out_file) if os.path.exists(out_file) else 0
+        total_parts = max(1, (file_size + TG_MAX_BYTES - 1) // TG_MAX_BYTES)
+        summary_lines = [
+            f"\u2705 Search complete for '{term}'",
+            f"",
+            f"\U0001f4cb Results",
+            f"  Raw hits : {int(hits):,}",
+            f"  ULP      : {int(ulp):,}",
+            f"  Combos   : {int(combos):,}",
+            f"  Time     : {elapsed}s",
+        ]
+        if mode == "ulp" and ulp_bytes:
+            summary_lines.append(f"  File     : {_fmt_bytes(ulp_bytes)}")
+        elif mode == "combo" and combo_bytes:
+            summary_lines.append(f"  File     : {_fmt_bytes(combo_bytes)}")
+        if total_parts > 1:
+            summary_lines.append(f"  Parts    : {total_parts} × 45 MB")
+        send_message(chat_id, "\n".join(summary_lines))
 
 
 def queue_worker():
-    """Single background thread — pulls jobs one at a time from JOB_QUEUE."""
     while True:
         chat_id, term, mode = JOB_QUEUE.get()
         with QUEUE_LOCK:
@@ -321,9 +336,9 @@ def enqueue(chat_id, term, mode):
         busy = RUNNING_JOB is not None
     if busy:
         send_message(chat_id,
-            f"\U0001f4cb Queued: '{term}' (position {position})\n"
-            f"A search is running. Yours starts when it finishes.\n"
-            f"Use /cancel to cancel the running job, or /queue to see the list.")
+            f"\U0001f4cb Queued '{term}' — position {position}\n"
+            f"Starts automatically when the current job finishes.\n"
+            f"/cancel — cancel running job | /queue — see full list")
     else:
         send_message(chat_id, f"\U0001f50e Starting '{term}'...")
 
@@ -335,8 +350,7 @@ def cmd_cancel(chat_id):
         send_message(chat_id, "\u2139\ufe0f No search is running right now.")
         return
     CANCEL_EVENT.set()
-    send_message(chat_id,
-        f"\u23f9 Cancelling '{job['term']}' — please wait...")
+    send_message(chat_id, f"\u23f9 Cancelling '{job['term']}' — please wait...")
 
 
 def cmd_queue(chat_id):
@@ -347,8 +361,8 @@ def cmd_queue(chat_id):
 
     lines = []
     if job:
-        label = "ULP" if job["mode"] == "ulp" else "COMBO"
-        lines.append(f"\U0001f7e2 Running : [{label}] {job['term']}")
+        lbl = "ULP" if job["mode"] == "ulp" else "COMBO"
+        lines.append(f"\U0001f7e2 Running : [{lbl}] {job['term']}")
     else:
         lines.append("\u26aa Idle")
 
@@ -361,6 +375,80 @@ def cmd_queue(chat_id):
         lines.append("\U0001f4cb Queue: empty")
 
     send_message(chat_id, "\n".join(lines))
+
+
+def cmd_status(chat_id):
+    lines = ["\U0001f5a5 Server Status", ""]
+
+    # disk usage of OUT_DIR
+    out_path = Path(OUT_DIR)
+    if out_path.exists():
+        files = sorted(
+            [f for f in out_path.iterdir() if f.is_file() and f.suffix == ".txt"],
+            key=lambda f: f.stat().st_mtime, reverse=True
+        )
+        total_size = sum(f.stat().st_size for f in files)
+        lines.append(f"\U0001f4c2 Result files in {OUT_DIR}")
+        lines.append(f"  Count      : {len(files)}")
+        lines.append(f"  Total size : {_fmt_bytes(total_size)}")
+        if files:
+            lines.append("")
+            lines.append("Recent files:")
+            for f in files[:8]:
+                lines.append(f"  {f.name} ({_fmt_bytes(f.stat().st_size)})")
+            if len(files) > 8:
+                lines.append(f"  ... and {len(files) - 8} more")
+    else:
+        lines.append(f"\u26a0\ufe0f OUT_DIR not found: {OUT_DIR}")
+
+    # overall disk usage
+    try:
+        df = subprocess.check_output(["df", "-h", "/"], text=True).splitlines()
+        if len(df) >= 2:
+            lines.append("")
+            lines.append("\U0001f4be Disk usage (/)")
+            lines.append(f"  {df[1]}")
+    except Exception:
+        pass
+
+    # running job
+    lines.append("")
+    with RUNNING_LOCK:
+        job = RUNNING_JOB
+    if job:
+        lbl = "ULP" if job["mode"] == "ulp" else "COMBO"
+        lines.append(f"\U0001f7e2 Running: [{lbl}] {job['term']}")
+    else:
+        lines.append("\u26aa Bot is idle")
+
+    send_message(chat_id, "\n".join(lines))
+
+
+def cmd_clean(chat_id):
+    out_path = Path(OUT_DIR)
+    if not out_path.exists():
+        send_message(chat_id, f"\u26a0\ufe0f OUT_DIR not found: {OUT_DIR}")
+        return
+
+    files = [f for f in out_path.iterdir()
+             if f.is_file() and f.suffix == ".txt"
+             and (f.name.startswith("ULP_") or f.name.startswith("COMBO_LP_"))]
+
+    if not files:
+        send_message(chat_id, "\U0001f9f9 No result files to clean.")
+        return
+
+    total_size = sum(f.stat().st_size for f in files)
+    deleted = 0
+    for f in files:
+        try:
+            f.unlink()
+            deleted += 1
+        except Exception:
+            pass
+
+    send_message(chat_id,
+        f"\U0001f9f9 Cleaned {deleted} file(s) — freed {_fmt_bytes(total_size)}")
 
 
 def handle_command(chat_id, text):
@@ -386,6 +474,12 @@ def handle_command(chat_id, text):
     elif text == "/queue":
         cmd_queue(chat_id)
 
+    elif text == "/status":
+        cmd_status(chat_id)
+
+    elif text == "/clean":
+        cmd_clean(chat_id)
+
     elif text in ("/start", "/help"):
         send_message(chat_id,
             "\U0001f985 Falcon Bot\n"
@@ -394,6 +488,8 @@ def handle_command(chat_id, text):
             "/c <term>   — search, return COMBO (user:pass)\n"
             "/cancel     — cancel the currently running search\n"
             "/queue      — show running job + pending queue\n"
+            "/status     — server disk usage + saved result files\n"
+            "/clean      — delete all saved result files\n"
             "/help       — this message")
 
 
