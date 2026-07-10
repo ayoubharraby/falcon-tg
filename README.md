@@ -110,9 +110,3 @@ sudo systemctl status tg-private-bot.service
 ## Environment example
 
 The file `.env.example` is included only as a template. It shows what values should exist if you later move configuration out of `bot.py`.
-
-## Practical answer to your question
-
-If `falcon_parse.py` and `bot.py` on the server are already the correct working copies, then yes — you do **not** need me to regenerate them just for this handoff.
-
-If you want a **true full backup or transfer package**, then yes — those two files should also be included in the final zip.
