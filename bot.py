@@ -51,15 +51,15 @@ OUT_DIR          = os.environ.get("OUT_DIR",    "/data/archives")
 PYTHON_BIN       = os.environ.get("PYTHON_BIN", "python3")
 FALCON_SCRIPT    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "falcon_parse.py")
 
-API = f"https://api.telegram.org/bot{TOKEN}"
+API            = f"https://api.telegram.org/bot{TOKEN}"
+TG_MAX_BYTES   = 45 * 1024 * 1024   # 45 MB — safe margin under Telegram's 50 MB bot limit
 
-# ── job queue & cancel state ─────────────────────────────────────────────────
-# Each item: (chat_id, term, mode)
+# ── job queue & cancel state ──────────────────────────────────────────────────
 JOB_QUEUE    = queue.Queue()
-QUEUE_LIST   = []          # mirror list for /queue display (protected by QUEUE_LOCK)
+QUEUE_LIST   = []
 QUEUE_LOCK   = threading.Lock()
-CANCEL_EVENT = threading.Event()   # set to request cancel of the running job
-RUNNING_JOB  = None               # dict with info about the currently running job
+CANCEL_EVENT = threading.Event()
+RUNNING_JOB  = None
 RUNNING_LOCK = threading.Lock()
 
 PROGRESS_RE = re.compile(
@@ -71,9 +71,9 @@ DONE_RE = re.compile(
 
 LAST_UPDATE_ID = 0
 
-# ── telegram helpers ─────────────────────────────────────────────────────────
-def api_post(method, data=None, files=None):
-    return requests.post(f"{API}/{method}", data=data, files=files, timeout=60)
+# ── telegram helpers ──────────────────────────────────────────────────────────
+def api_post(method, data=None, files=None, timeout=120):
+    return requests.post(f"{API}/{method}", data=data, files=files, timeout=timeout)
 
 def send_message(chat_id, text):
     r = api_post("sendMessage", {"chat_id": chat_id, "text": text})
@@ -92,23 +92,116 @@ def edit_message(chat_id, message_id, text):
     except Exception:
         pass
 
-def send_document(chat_id, file_path, caption=None):
-    with open(file_path, "rb") as f:
-        data = {"chat_id": chat_id}
-        if caption:
-            data["caption"] = caption
-        api_post("sendDocument", data=data, files={"document": f})
+def _send_one_document(chat_id, file_path, caption=None):
+    """Send a single file. Returns (ok: bool, error_description: str)."""
+    try:
+        with open(file_path, "rb") as f:
+            data = {"chat_id": chat_id}
+            if caption:
+                data["caption"] = caption
+            r = api_post("sendDocument", data=data,
+                         files={"document": (Path(file_path).name, f)},
+                         timeout=300)
+        j = r.json()
+        if j.get("ok"):
+            return True, ""
+        return False, j.get("description", "unknown error")
+    except Exception as e:
+        return False, str(e)
+
+def _split_and_send(chat_id, file_path, caption, msg_id):
+    """
+    Split file_path into <=45 MB chunks, send each as a separate document.
+    Updates the progress message as it uploads each part.
+    Returns True if all parts sent successfully.
+    """
+    file_size   = os.path.getsize(file_path)
+    stem        = Path(file_path).stem
+    ext         = Path(file_path).suffix
+    tmp_dir     = Path(file_path).parent
+    total_parts = (file_size + TG_MAX_BYTES - 1) // TG_MAX_BYTES
+    part_paths  = []
+
+    edit_message(chat_id, msg_id,
+        f"\u2702\ufe0f File is {file_size / 1024 / 1024:.1f} MB — "
+        f"splitting into {total_parts} parts...")
+
+    try:
+        with open(file_path, "rb") as src:
+            for i in range(total_parts):
+                part_name = tmp_dir / f"{stem}.part{i+1}of{total_parts}{ext}"
+                with open(part_name, "wb") as dst:
+                    dst.write(src.read(TG_MAX_BYTES))
+                part_paths.append(part_name)
+    except Exception as e:
+        edit_message(chat_id, msg_id, f"\u274c Failed to split file: {e}")
+        return False
+
+    all_ok = True
+    for i, part in enumerate(part_paths, 1):
+        part_size = os.path.getsize(part) / 1024 / 1024
+        edit_message(chat_id, msg_id,
+            f"\u2b06\ufe0f Uploading part {i}/{total_parts} "
+            f"({part_size:.1f} MB)...")
+        part_caption = f"{caption} — part {i}/{total_parts}"
+        ok, err = _send_one_document(chat_id, str(part), caption=part_caption)
+        if not ok:
+            edit_message(chat_id, msg_id,
+                f"\u274c Upload failed on part {i}/{total_parts}: {err}")
+            all_ok = False
+            break
+
+    for part in part_paths:
+        try:
+            part.unlink()
+        except Exception:
+            pass
+
+    return all_ok
+
+
+def deliver_file(chat_id, file_path, label, term, msg_id):
+    """
+    Smart delivery: send directly if <=45 MB, auto-split if larger.
+    Updates msg_id with status throughout.
+    """
+    file_size = os.path.getsize(file_path)
+    caption   = f"{label} results for: {term}"
+
+    if file_size <= TG_MAX_BYTES:
+        edit_message(chat_id, msg_id,
+            f"\u2b06\ufe0f Uploading ({file_size / 1024 / 1024:.1f} MB)...")
+        ok, err = _send_one_document(chat_id, file_path, caption=caption)
+        if ok:
+            edit_message(chat_id, msg_id,
+                f"\u2705 Done. '{term}' results sent \u2b07\ufe0f")
+        else:
+            edit_message(chat_id, msg_id,
+                f"\u274c Upload failed: {err}\n"
+                f"File saved on server at:\n{file_path}")
+    else:
+        ok = _split_and_send(chat_id, file_path, caption, msg_id)
+        if ok:
+            total_parts = (file_size + TG_MAX_BYTES - 1) // TG_MAX_BYTES
+            edit_message(chat_id, msg_id,
+                f"\u2705 Done. '{term}' results sent in {total_parts} parts \u2b07\ufe0f\n"
+                f"Total size: {file_size / 1024 / 1024:.1f} MB")
+        else:
+            edit_message(chat_id, msg_id,
+                f"\u274c Partial upload failure.\n"
+                f"Full file saved on server at:\n{file_path}")
+
 
 def safe_term(term):
     return re.sub(r"[^\w\-\.]", "_", term)
 
-# ── worker ───────────────────────────────────────────────────────────────────
+# ── worker ────────────────────────────────────────────────────────────────────
 def run_falcon(chat_id, term, mode):
     """Execute one Falcon job. Called by the queue worker thread."""
     global RUNNING_JOB
 
-    st    = safe_term(term)
-    label = "ULP (full hits)" if mode == "ulp" else "COMBO (user:pass)"
+    st       = safe_term(term)
+    label    = "ULP (full hits)" if mode == "ulp" else "COMBO (user:pass)"
     out_file = os.path.join(OUT_DIR,
         f"ULP_{st}.txt" if mode == "ulp" else f"COMBO_LP_{st}.txt")
 
@@ -117,7 +210,7 @@ def run_falcon(chat_id, term, mode):
     CANCEL_EVENT.clear()
 
     msg_id = send_message(chat_id,
-        f"\U0001f50e Searching '{term}' \u2014 {label}\nStarting...")
+        f"\U0001f50e Searching '{term}' — {label}\nStarting...")
     if msg_id is None:
         with RUNNING_LOCK:
             RUNNING_JOB = None
@@ -137,7 +230,6 @@ def run_falcon(chat_id, term, mode):
 
     try:
         for line in proc.stdout:
-            # ── check cancel ──
             if CANCEL_EVENT.is_set():
                 proc.kill()
                 cancelled = True
@@ -153,13 +245,13 @@ def run_falcon(chat_id, term, mode):
                 elapsed = m.group(5)
                 if phase == "1":
                     hits, ulp = m.group(2), m.group(3)
-                    text = (f"\U0001f50e Searching '{term}' \u2014 {label}\n"
+                    text = (f"\U0001f50e Searching '{term}' — {label}\n"
                             f"Phase 1: scanning\n"
                             f"Hits: {hits}  |  Unique: {ulp}\n"
                             f"Elapsed: {elapsed}s")
                 else:
                     combos = m.group(4)
-                    text = (f"\U0001f50e Searching '{term}' \u2014 {label}\n"
+                    text = (f"\U0001f50e Searching '{term}' — {label}\n"
                             f"Phase 2: extracting combos\n"
                             f"Combos: {combos}\n"
                             f"Elapsed: {elapsed}s")
@@ -172,7 +264,7 @@ def run_falcon(chat_id, term, mode):
                 hits, ulp, combos, elapsed = d.groups()
                 text = (f"\u2705 Done '{term}'\n"
                         f"Raw hits: {hits}  |  ULP: {ulp}  |  Combos: {combos}\n"
-                        f"Time: {elapsed}s\nUploading...")
+                        f"Time: {elapsed}s\nPreparing upload...")
                 edit_message(chat_id, msg_id, text)
 
         proc.wait()
@@ -200,21 +292,13 @@ def run_falcon(chat_id, term, mode):
             f"\u26a0\ufe0f No results for '{term}' ({label}).")
         return
 
-    try:
-        send_document(chat_id, out_file,
-            caption=f"{label} results for: {term}")
-        edit_message(chat_id, msg_id,
-            f"\u2705 Done. '{term}' results sent \u2b07\ufe0f")
-    except Exception as e:
-        edit_message(chat_id, msg_id,
-            f"\u274c Upload failed: {e}")
+    deliver_file(chat_id, out_file, label, term, msg_id)
 
 
 def queue_worker():
     """Single background thread — pulls jobs one at a time from JOB_QUEUE."""
     while True:
         chat_id, term, mode = JOB_QUEUE.get()
-        # remove from mirror list
         with QUEUE_LOCK:
             if (chat_id, term, mode) in QUEUE_LIST:
                 QUEUE_LIST.remove((chat_id, term, mode))
@@ -226,24 +310,22 @@ def queue_worker():
             JOB_QUEUE.task_done()
 
 
-# ── command handling ─────────────────────────────────────────────────────────
+# ── command handling ──────────────────────────────────────────────────────────
 def enqueue(chat_id, term, mode):
     with QUEUE_LOCK:
         position = len(QUEUE_LIST) + 1
         QUEUE_LIST.append((chat_id, term, mode))
     JOB_QUEUE.put((chat_id, term, mode))
 
-    # tell user where they are
     with RUNNING_LOCK:
         busy = RUNNING_JOB is not None
     if busy:
         send_message(chat_id,
             f"\U0001f4cb Queued: '{term}' (position {position})\n"
-            f"A search is already running. Yours starts when it finishes.\n"
-            f"Use /cancel to cancel the RUNNING job, or /queue to see the list.")
+            f"A search is running. Yours starts when it finishes.\n"
+            f"Use /cancel to cancel the running job, or /queue to see the list.")
     else:
-        send_message(chat_id,
-            f"\U0001f50e Starting '{term}'...")
+        send_message(chat_id, f"\U0001f50e Starting '{term}'...")
 
 
 def cmd_cancel(chat_id):
@@ -254,7 +336,7 @@ def cmd_cancel(chat_id):
         return
     CANCEL_EVENT.set()
     send_message(chat_id,
-        f"\u23f9 Cancelling '{job['term']}' \u2014 please wait...")
+        f"\u23f9 Cancelling '{job['term']}' — please wait...")
 
 
 def cmd_queue(chat_id):
@@ -308,18 +390,17 @@ def handle_command(chat_id, text):
         send_message(chat_id,
             "\U0001f985 Falcon Bot\n"
             "\n"
-            "/s <term>   \u2014 search, return ULP (full hits)\n"
-            "/c <term>   \u2014 search, return COMBO (user:pass)\n"
-            "/cancel     \u2014 cancel the currently running search\n"
-            "/queue      \u2014 show running job + pending queue\n"
-            "/help       \u2014 this message")
+            "/s <term>   — search, return ULP (full hits)\n"
+            "/c <term>   — search, return COMBO (user:pass)\n"
+            "/cancel     — cancel the currently running search\n"
+            "/queue      — show running job + pending queue\n"
+            "/help       — this message")
 
 
-# ── main polling loop ────────────────────────────────────────────────────────
+# ── main polling loop ─────────────────────────────────────────────────────────
 def main():
     global LAST_UPDATE_ID
 
-    # start the single queue worker thread
     t = threading.Thread(target=queue_worker, daemon=True)
     t.start()
 
