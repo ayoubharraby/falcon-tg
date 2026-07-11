@@ -1,88 +1,129 @@
 # falcon-tg
 
-A private Telegram bot that runs **Falcon** — a fast credential-extraction engine — on a local dataset and delivers results directly in Telegram, with live progress, a job queue, cancel support, and smart large-file splitting.
+A private Telegram bot that runs **Falcon** — a fast credential-extraction engine — on a local dataset and delivers results directly in Telegram, with a **fully button-driven interface**, live progress, a job queue, cancel support, and smart large-file splitting.
 
 ---
 
-## Commands
+## Navigation (BotFather-style)
+
+The bot is fully navigated via **inline buttons**. You never need to type slash commands for normal use.
+
+```
+/start  →  Main Menu
+```
+
+```
+💅 Falcon Bot  v3.0.0
+―――――――――――――
+⚪ Idle
+
+Choose an action:
+
+[ 🔍 Search ]   [ 📋 Queue  ]
+[ 🖥️ Status ]   [ 💾 RAM    ]
+[ 📥 Results  ]
+```
+
+### Search flow
+
+1. Tap **🔍 Search** → bot asks for your term
+2. Type your term (e.g. `netflix.com`) → your message is auto-deleted, the nav message updates in-place
+3. **Mode selector** appears:
+
+```
+🔍  Term: netflix.com
+―――――――――――――
+Select search mode:
+
+[ 📄 ULP  (full hits)       ]
+[ 🔑 COMBO (user:pass only)  ]
+[ 🔙 Back                    ]
+```
+
+4. Tap a mode → mode selector disappears, search starts
+
+### Live progress
+
+Progress message updates at **1.5 s intervals** (fastest safe rate without hitting Telegram rate limits). Includes a live **[Cancel]** button:
+
+```
+🔎  [ULP]  netflix.com
+―――――――――――――
+🟡  Phase 1 — Scanning
+  [█████░░░░░]  50%
+  Hits    : 642,150
+  Unique  : 481,200
+  Elapsed : 14.3s
+
+[ ⏹ Cancel ]
+```
+
+### Done
+
+```
+✅  Done — netflix.com
+―――――――――――――
+  Hits    : 1,284,301
+  ULP     : 948,200
+  Combos  : 621,440
+  Time    : 38.7s
+  File    : 87.4 MB
+
+[ 🔍 Search Again ]  [ 🏠 Home ]
+```
+
+---
+
+## Slash Commands (still work)
 
 | Command | Description |
 |---|---|
-| `/s <term>` | Search and return full cleaned hits **(ULP format** — full `url:user:pass` lines) |
-| `/c <term>` | Search and return clean `user:pass` combos only |
-| `/cancel` | Cancel the currently **running** search (queued jobs are unaffected) |
-| `/queue` | Show the running job + full pending queue |
-| `/status` | Show server disk usage and saved result files |
-| `/ram` | Show server RAM usage (total, used, available, swap) |
-| `/clean` | Delete all saved result files from `OUT_DIR` |
-| `/help` | Show command list |
-
-### What you get after a search
-
-While searching, the bot edits a single message in real time:
-
-```
-🔎 Searching 'netflix.com' — ULP (full hits)
-Phase 1 — scanning
-Raw hits : 1,284,301
-Unique   : 948,200
-Elapsed  : 14.3s
-```
-
-Once done, you receive a **technical summary** message:
-
-```
-✅ Search complete for 'netflix.com'
-
-📋 Results
-  Raw hits : 1,284,301
-  ULP      : 948,200
-  Combos   : 621,440
-  Time     : 38.7s
-  File     : 87.4 MB
-```
-
-For files **over 45 MB**, the bot automatically splits them and sends each part:
-
-```
-✂️ File is 210.3 MB — splitting into 5 parts...
-⬆️ Uploading part 1/5 (45.0 MB)...
-⬆️ Uploading part 2/5 (45.0 MB)...
-...
-✅ Done. 'netflix.com' results sent in 5 parts ⬇️
-Total size: 210.3 MB
-```
+| `/start` | Open main menu |
+| `/s <term>` | Jump directly to mode selector for a term |
+| `/c <term>` | Run COMBO search directly |
+| `/cancel` | Cancel the currently running search |
+| `/queue` | Show queue screen |
+| `/status` | Show status screen |
+| `/ram` | Show RAM screen |
+| `/clean` | Delete all saved result files |
 
 ---
 
 ## Features
 
+### GUI & Navigation
+
+- **Fully inline-keyboard driven** — buttons for all actions, no typing needed
+- **BotFather-style navigation** — nav messages edit in-place or auto-delete when you move on; the chat stays clean
+- **Mode selector** — ULP vs COMBO chosen via buttons, not slash commands
+- **Live [Cancel] button** on every progress message
+- **[Search Again] + [Home]** buttons on completion
+- **[Refresh] + [Back]** on Status, RAM, Queue screens
+- **[Clean All]** on Results screen
+- User-typed search term auto-deleted to keep chat clean
+
+### Update Speed
+
+- Progress messages update every **1.5 s** — fastest safe interval (Telegram allows ~30 edits/min per message; 1.5 s = 40/min, staying just under with retry tolerance)
+- `getUpdates` polling every **0.3 s** — near-instant button response
+- `answerCallbackQuery` called immediately on every button press — spinner disappears instantly
+
 ### Search Engine (falcon_parse.py)
 
-- **ripgrep** with `--mmap` (memory-mapped I/O) and `--no-unicode` for maximum throughput on large datasets
-- **`-j <cpu_count>`** parallel threads — scales automatically to the server's core count
-- **mmap-based pure-Python fallback** when ripgrep is not installed — uses `mmap.mmap()` for OS-level memory-mapped reads instead of slow Python buffered I/O
-- **4 MB write buffer** for temp file output — fewer syscalls, faster phase-1 streaming
-- **GNU sort dedup with `--buffer-size=512M` and `--parallel=<cpu_count>`** — faster multi-pass sort with a larger in-memory buffer
-- Balanced phase-2 chunk size (min 10 000 / max 50 000 per worker) — avoids tiny batch overhead and memory spikes
-- `sort -o <dst>` used directly — avoids `/dev/stdout` compatibility issues on some systems
+- `ripgrep` with `--mmap` + `--no-unicode` + `-j <cpus>` for maximum throughput
+- mmap-based pure-Python fallback when ripgrep is unavailable
+- 4 MB write buffer, GNU sort with `--buffer-size=512M --parallel=<cpus>`
+- Balanced phase-2 chunk size (10k–50k per worker)
 
-### Bot (bot.py)
+### Bot Reliability
 
-- **Persistent `requests.Session`** with connection pooling (`pool_maxsize=8`) — eliminates per-request TCP + TLS handshake overhead
-- **Automatic retry adapter** — retries on Telegram 5xx responses (3 attempts, exponential backoff `×0.5`)
-- **Exponential backoff on polling errors** — starts at 2 s, doubles up to 60 s, resets on success
-- **`/ram` command** — shows total / used / available RAM and swap via `/proc/meminfo` (no extra dependencies)
-- **`collections.deque` queue list** — O(1) append/remove vs the previous O(n) list
-- **df result cached for 10 s** — `/status` no longer spawns a subprocess on every call
-- **Full traceback logging** in `queue_worker` — unhandled errors are printed with a full stack trace instead of silently disappearing
-- **`UPDATE_LOCK`** protecting `LAST_UPDATE_ID` — thread-safe update ID tracking
-- File size read once in `deliver_file` — avoids a redundant `os.path.getsize` call
-- `shutil.copyfileobj` for file splitting — avoids loading an entire 45 MB chunk into RAM
-
-### General
-- Both files versioned (`__version__` string) for easier change tracking
-- `_NULL_VALUES` frozenset in parser — faster membership test than tuple comparison
+- Persistent `requests.Session` with connection pooling (`pool_maxsize=10`)
+- Auto-retry on Telegram 5xx (3 attempts, backoff×0.4)
+- Exponential backoff on polling errors (2s → 60s)
+- `collections.deque` job queue (O(1) ops)
+- Full traceback logging in `queue_worker`
+- `UPDATE_LOCK` protecting `LAST_UPDATE_ID`
+- df result cached for 8 s
 
 ---
 
@@ -91,43 +132,39 @@ Total size: 210.3 MB
 Two-phase pipeline:
 
 **Phase 1 — Search**
-- Uses `ripgrep` if installed (preferred) with `--mmap`, `--no-unicode`, and `-j <cpus>` for maximum speed
-- Falls back to mmap-based `ProcessPoolExecutor` pure-Python grep if ripgrep is not available
-- Streams hits directly to a temp file on disk — **no RAM accumulation**
-- Deduplicates via `sort -u --buffer-size=512M --parallel=<cpus>` (disk-based — handles any file size)
+- Uses `ripgrep` if installed (preferred) with `--mmap`, `--no-unicode`, and `-j <cpus>`
+- Falls back to mmap-based `ProcessPoolExecutor` pure-Python grep
+- Streams hits to disk — no RAM accumulation
+- Deduplicates via `sort -u --buffer-size=512M --parallel=<cpus>`
 - Output: `ULP_{term}.txt`
 
 **Phase 2 — Combo extraction**
-- Reads Phase 1 output, strips URL schemes / bracket prefixes / promo tails / mojibake
-- Extracts clean `user:pass` pairs using a multi-core `ProcessPoolExecutor` with balanced chunk sizes
-- Deduplicates again via `sort -u`
+- Extracts clean `user:pass` pairs with multi-core `ProcessPoolExecutor`
+- Deduplicates via `sort -u`
 - Output: `COMBO_LP_{term}.txt`
 
-> Every search **overwrites** any previous result file for the same term. No stale data.
+> Every search **overwrites** any previous result for the same term.
 
 ---
 
 ## Queue Behavior
 
 - Only **one search runs at a time**
-- Additional `/s` or `/c` commands are **queued in order** and run automatically when the current job finishes
-- `/cancel` kills only the **running** job — queued jobs continue unaffected
-- `/queue` shows both the running job and the full pending list
+- Additional searches are **queued in order**
+- `/cancel` kills only the **running** job — queued jobs continue
+- Queue screen shows running job + full pending list with a **[Cancel Job]** button
 
 ---
 
 ## Large File Handling
 
-Telegram bots have a **50 MB upload limit**. Falcon-TG handles this transparently:
-
-- Files **≤ 45 MB** → sent directly as a single document
-- Files **> 45 MB** → automatically split into 45 MB chunks and sent as numbered parts (e.g. `ULP_netflix.com.part1of5.txt`)
-- Splitting uses `shutil.copyfileobj` — no large RAM spike during chunking
-- If any part fails, you're told exactly which part and the full file path on the server
+- Files **≤ 45 MB** → sent directly
+- Files **> 45 MB** → auto-split into 45 MB chunks via `shutil.copyfileobj`
+- If any part fails, you’re told exactly which part + file path on server
 
 ---
 
-## First-time Deploy (fresh server)
+## First-time Deploy
 
 ```bash
 git clone https://github.com/ayoubharraby/falcon-tg.git
@@ -135,36 +172,17 @@ cd falcon-tg
 bash setup.sh
 ```
 
-`setup.sh` will:
-1. Install system packages (`python3`, `ripgrep`, etc.)
-2. Create `/data/textset` and `/data/archives`
-3. Set up Python virtualenv and install deps
-4. Ask for your **bot token** and **Telegram user ID**, write them to `.env`
-5. Install and start the systemd service
-
 ---
 
-## Updating the Bot
-
-Every time you push new code to GitHub, update your server with **one command**:
+## Updating
 
 ```bash
 bash ~/falcon-tg/update.sh
 ```
 
-This will:
-1. Stash any local changes if needed, then `git pull origin main`
-2. Re-install any new/updated Python dependencies
-3. `systemctl restart` the service (graceful shutdown → fresh start)
-4. Print the service status and last 20 log lines
-
-If `git pull` fails (e.g. a merge conflict), the script stops with a clear error message — it will **never restart the bot with stale code**.
-
 ---
 
 ## Configuration (`.env`)
-
-All config lives in `.env` (copy from `env.example`):
 
 ```env
 TELEGRAM_BOT_TOKEN=your-token-here
@@ -177,35 +195,19 @@ PYTHON_BIN=python3
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | ✅ | — | From [@BotFather](https://t.me/BotFather) |
-| `ALLOWED_CHAT_IDS` | ✅ | — | Comma-separated Telegram user IDs. Get yours from [@userinfobot](https://t.me/userinfobot) |
-| `SOURCE_DIR` | — | `/data/textset` | Directory (or file) containing your dataset |
-| `OUT_DIR` | — | `/data/archives` | Where result files are saved |
-| `PYTHON_BIN` | — | `python3` | Python binary to use (e.g. path to venv python) |
-
----
-
-## Dataset
-
-Place your `.txt` files inside `SOURCE_DIR` (default: `/data/textset/`).  
-Subdirectories are supported — Falcon scans recursively.  
-`ripgrep` is strongly recommended: `sudo apt install ripgrep`
+| `ALLOWED_CHAT_IDS` | ✅ | — | Comma-separated Telegram user IDs |
+| `SOURCE_DIR` | — | `/data/textset` | Dataset directory or file |
+| `OUT_DIR` | — | `/data/archives` | Result file output directory |
+| `PYTHON_BIN` | — | `python3` | Python binary path |
 
 ---
 
 ## Service Management
 
 ```bash
-# Live logs
 sudo journalctl -u tg-private-bot -f
-
-# Restart after manual changes to bot.py or .env
 sudo systemctl restart tg-private-bot
-
-# Stop / Start
 sudo systemctl stop tg-private-bot
-sudo systemctl start tg-private-bot
-
-# Check status
 sudo systemctl status tg-private-bot
 ```
 
@@ -215,7 +217,7 @@ sudo systemctl status tg-private-bot
 
 - Ubuntu / Debian Linux
 - Python 3.8+
-- `ripgrep` (optional but strongly recommended: `sudo apt install ripgrep`)
-- GNU `sort` (pre-installed on all Linux distros)
+- `ripgrep` (strongly recommended: `sudo apt install ripgrep`)
+- GNU `sort`
 - `requests>=2.31.0`
-- `urllib3>=1.26.0` (included with requests)
+- `urllib3>=1.26.0`
