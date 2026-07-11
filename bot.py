@@ -8,19 +8,27 @@ Commands:
   /cancel      cancel the running search (queued jobs stay)
   /queue       show the current job queue
   /status      show server disk usage + saved result files
+  /ram         show server RAM usage
   /clean       delete all saved result files from OUT_DIR
   /help        show this help
 
 Config: copy env.example to .env and fill in your values.
 """
+__version__ = "2.0.0"
+
 import os
 import re
 import time
 import queue
-import requests
+import traceback
 import subprocess
 import threading
+import collections
 from pathlib import Path
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ── load .env ────────────────────────────────────────────────────────────────
 def _load_env():
@@ -54,11 +62,31 @@ PYTHON_BIN       = os.environ.get("PYTHON_BIN", "python3")
 FALCON_SCRIPT    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "falcon_parse.py")
 
 API          = f"https://api.telegram.org/bot{TOKEN}"
-TG_MAX_BYTES = 45 * 1024 * 1024  # 45 MB safe margin under Telegram's 50 MB bot limit
+TG_MAX_BYTES = 45 * 1024 * 1024
+
+# ── persistent HTTP session with retry + connection pooling ──────────────────
+def _build_session():
+    """
+    Reusing a session avoids a full TCP + TLS handshake on every API call.
+    Retry adapter handles transient Telegram 5xx errors automatically.
+    """
+    s = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=("GET", "POST"),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
+    s.mount("https://", adapter)
+    s.mount("http://",  adapter)
+    return s
+
+_SESSION = _build_session()
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 def _fmt_bytes(n):
-    """Human-readable file size."""
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024:
             return f"{n:.1f} {unit}"
@@ -67,11 +95,12 @@ def _fmt_bytes(n):
 
 # ── job queue & cancel state ──────────────────────────────────────────────────
 JOB_QUEUE    = queue.Queue()
-QUEUE_LIST   = []
+QUEUE_LIST   = collections.deque()   # O(1) append/remove vs list O(n)
 QUEUE_LOCK   = threading.Lock()
 CANCEL_EVENT = threading.Event()
 RUNNING_JOB  = None
 RUNNING_LOCK = threading.Lock()
+UPDATE_LOCK  = threading.Lock()      # protects LAST_UPDATE_ID
 
 PROGRESS_RE = re.compile(
     r'PROGRESS phase=(\d+)\s+(?:hits=(\d+)\s+ulp=(\d+)|combos=(\d+))\s+elapsed=([\d.]+)'
@@ -83,9 +112,28 @@ DONE_RE = re.compile(
 
 LAST_UPDATE_ID = 0
 
+# ── df cache: avoid subprocess on every /status call ─────────────────────────
+_DF_CACHE      = ("", 0.0)   # (output, timestamp)
+_DF_CACHE_TTL  = 10.0        # seconds
+_DF_LOCK       = threading.Lock()
+
+def _get_disk_info():
+    global _DF_CACHE
+    with _DF_LOCK:
+        output, ts = _DF_CACHE
+        if time.time() - ts < _DF_CACHE_TTL:
+            return output
+        try:
+            lines = subprocess.check_output(["df", "-h", "/"], text=True).splitlines()
+            output = lines[1] if len(lines) >= 2 else ""
+        except Exception:
+            output = ""
+        _DF_CACHE = (output, time.time())
+        return output
+
 # ── telegram helpers ──────────────────────────────────────────────────────────
 def api_post(method, data=None, files=None, timeout=120):
-    return requests.post(f"{API}/{method}", data=data, files=files, timeout=timeout)
+    return _SESSION.post(f"{API}/{method}", data=data, files=files, timeout=timeout)
 
 def send_message(chat_id, text):
     r = api_post("sendMessage", {"chat_id": chat_id, "text": text})
@@ -97,9 +145,9 @@ def send_message(chat_id, text):
 def edit_message(chat_id, message_id, text):
     try:
         api_post("editMessageText", {
-            "chat_id": chat_id,
+            "chat_id":    chat_id,
             "message_id": message_id,
-            "text": text,
+            "text":       text,
         })
     except Exception:
         pass
@@ -136,7 +184,9 @@ def _split_and_send(chat_id, file_path, caption, msg_id):
             for i in range(total_parts):
                 part_name = tmp_dir / f"{stem}.part{i+1}of{total_parts}{ext}"
                 with open(part_name, "wb") as dst:
-                    dst.write(src.read(TG_MAX_BYTES))
+                    # shutil.copyfileobj avoids a single giant read() into RAM
+                    import shutil
+                    shutil.copyfileobj(src, dst, length=TG_MAX_BYTES)
                 part_paths.append(part_name)
     except Exception as e:
         edit_message(chat_id, msg_id, f"\u274c Failed to split file: {e}")
@@ -163,7 +213,7 @@ def _split_and_send(chat_id, file_path, caption, msg_id):
     return all_ok
 
 def deliver_file(chat_id, file_path, label, term, msg_id):
-    file_size = os.path.getsize(file_path)
+    file_size = os.path.getsize(file_path)   # read once
     caption   = f"{label} results for: {term}"
 
     if file_size <= TG_MAX_BYTES:
@@ -213,7 +263,7 @@ def run_falcon(chat_id, term, mode):
     last_text  = ""
     last_edit  = 0
     cancelled  = False
-    done_stats = None  # will hold parsed DONE line data
+    done_stats = None
 
     try:
         for line in proc.stdout:
@@ -285,13 +335,11 @@ def run_falcon(chat_id, term, mode):
             f"\u26a0\ufe0f No results for '{term}' ({label}).")
         return
 
-    # deliver file
     deliver_file(chat_id, out_file, label, term, msg_id)
 
-    # final technical summary after upload
     if done_stats:
         hits, ulp, combos, elapsed, ulp_bytes, combo_bytes = done_stats
-        file_size = os.path.getsize(out_file) if os.path.exists(out_file) else 0
+        file_size   = os.path.getsize(out_file) if os.path.exists(out_file) else 0
         total_parts = max(1, (file_size + TG_MAX_BYTES - 1) // TG_MAX_BYTES)
         summary_lines = [
             f"\u2705 Search complete for '{term}'",
@@ -315,12 +363,14 @@ def queue_worker():
     while True:
         chat_id, term, mode = JOB_QUEUE.get()
         with QUEUE_LOCK:
-            if (chat_id, term, mode) in QUEUE_LIST:
+            try:
                 QUEUE_LIST.remove((chat_id, term, mode))
+            except ValueError:
+                pass
         try:
             run_falcon(chat_id, term, mode)
-        except Exception as e:
-            print(f"[queue_worker] unhandled error: {e}")
+        except Exception:
+            print(f"[queue_worker] unhandled error:\n{traceback.format_exc()}")
         finally:
             JOB_QUEUE.task_done()
 
@@ -380,7 +430,6 @@ def cmd_queue(chat_id):
 def cmd_status(chat_id):
     lines = ["\U0001f5a5 Server Status", ""]
 
-    # disk usage of OUT_DIR
     out_path = Path(OUT_DIR)
     if out_path.exists():
         files = sorted(
@@ -401,17 +450,13 @@ def cmd_status(chat_id):
     else:
         lines.append(f"\u26a0\ufe0f OUT_DIR not found: {OUT_DIR}")
 
-    # overall disk usage
-    try:
-        df = subprocess.check_output(["df", "-h", "/"], text=True).splitlines()
-        if len(df) >= 2:
-            lines.append("")
-            lines.append("\U0001f4be Disk usage (/)")
-            lines.append(f"  {df[1]}")
-    except Exception:
-        pass
+    # cached disk usage
+    df_line = _get_disk_info()
+    if df_line:
+        lines.append("")
+        lines.append("\U0001f4be Disk usage (/)")
+        lines.append(f"  {df_line}")
 
-    # running job
     lines.append("")
     with RUNNING_LOCK:
         job = RUNNING_JOB
@@ -421,6 +466,33 @@ def cmd_status(chat_id):
     else:
         lines.append("\u26aa Bot is idle")
 
+    send_message(chat_id, "\n".join(lines))
+
+
+def cmd_ram(chat_id):
+    """Show RAM usage from /proc/meminfo (no psutil dependency)."""
+    lines = ["\U0001f4be RAM Usage", ""]
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    info[parts[0].rstrip(":")] = int(parts[1])
+        total     = info.get("MemTotal", 0)
+        available = info.get("MemAvailable", 0)
+        used      = total - available
+        pct       = (used / total * 100) if total else 0
+        lines.append(f"  Total     : {_fmt_bytes(total * 1024)}")
+        lines.append(f"  Used      : {_fmt_bytes(used  * 1024)} ({pct:.1f}%)")
+        lines.append(f"  Available : {_fmt_bytes(available * 1024)}")
+        swap_total = info.get("SwapTotal", 0)
+        swap_free  = info.get("SwapFree",  0)
+        if swap_total:
+            swap_used = swap_total - swap_free
+            lines.append(f"  Swap used : {_fmt_bytes(swap_used * 1024)} / {_fmt_bytes(swap_total * 1024)}")
+    except Exception as e:
+        lines.append(f"\u26a0\ufe0f Could not read /proc/meminfo: {e}")
     send_message(chat_id, "\n".join(lines))
 
 
@@ -477,6 +549,9 @@ def handle_command(chat_id, text):
     elif text == "/status":
         cmd_status(chat_id)
 
+    elif text == "/ram":
+        cmd_ram(chat_id)
+
     elif text == "/clean":
         cmd_clean(chat_id)
 
@@ -489,6 +564,7 @@ def handle_command(chat_id, text):
             "/cancel     — cancel the currently running search\n"
             "/queue      — show running job + pending queue\n"
             "/status     — server disk usage + saved result files\n"
+            "/ram        — server RAM usage\n"
             "/clean      — delete all saved result files\n"
             "/help       — this message")
 
@@ -500,22 +576,26 @@ def main():
     t = threading.Thread(target=queue_worker, daemon=True)
     t.start()
 
-    print(f"Bot started. Polling... (source={SOURCE_DIR}, out={OUT_DIR})")
+    print(f"Falcon Bot v{__version__} started. Polling... (source={SOURCE_DIR}, out={OUT_DIR})")
+    backoff = 2.0
     while True:
         try:
-            r = requests.get(f"{API}/getUpdates", params={
-                "offset": LAST_UPDATE_ID + 1,
-                "timeout": 30,
+            r = _SESSION.get(f"{API}/getUpdates", params={
+                "offset":          LAST_UPDATE_ID + 1,
+                "timeout":         30,
                 "allowed_updates": '["message"]',
             }, timeout=40).json()
+            backoff = 2.0  # reset on success
         except Exception as e:
             print(f"getUpdates error: {e}")
-            time.sleep(2)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)  # exponential backoff, cap 60s
             continue
 
         if r.get("ok"):
             for upd in r["result"]:
-                LAST_UPDATE_ID = upd["update_id"]
+                with UPDATE_LOCK:
+                    LAST_UPDATE_ID = upd["update_id"]
                 msg     = upd.get("message", {})
                 chat_id = msg.get("chat", {}).get("id")
                 text    = msg.get("text", "")

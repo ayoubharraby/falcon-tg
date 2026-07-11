@@ -13,6 +13,7 @@ A private Telegram bot that runs **Falcon** — a fast credential-extraction eng
 | `/cancel` | Cancel the currently **running** search (queued jobs are unaffected) |
 | `/queue` | Show the running job + full pending queue |
 | `/status` | Show server disk usage and saved result files |
+| `/ram` | Show server RAM usage (total, used, available, swap) |
 | `/clean` | Delete all saved result files from `OUT_DIR` |
 | `/help` | Show command list |
 
@@ -54,20 +55,51 @@ Total size: 210.3 MB
 
 ---
 
+## Features
+
+### Search Engine (falcon_parse.py)
+
+- **ripgrep** with `--mmap` (memory-mapped I/O) and `--no-unicode` for maximum throughput on large datasets
+- **`-j <cpu_count>`** parallel threads — scales automatically to the server's core count
+- **mmap-based pure-Python fallback** when ripgrep is not installed — uses `mmap.mmap()` for OS-level memory-mapped reads instead of slow Python buffered I/O
+- **4 MB write buffer** for temp file output — fewer syscalls, faster phase-1 streaming
+- **GNU sort dedup with `--buffer-size=512M` and `--parallel=<cpu_count>`** — faster multi-pass sort with a larger in-memory buffer
+- Balanced phase-2 chunk size (min 10 000 / max 50 000 per worker) — avoids tiny batch overhead and memory spikes
+- `sort -o <dst>` used directly — avoids `/dev/stdout` compatibility issues on some systems
+
+### Bot (bot.py)
+
+- **Persistent `requests.Session`** with connection pooling (`pool_maxsize=8`) — eliminates per-request TCP + TLS handshake overhead
+- **Automatic retry adapter** — retries on Telegram 5xx responses (3 attempts, exponential backoff `×0.5`)
+- **Exponential backoff on polling errors** — starts at 2 s, doubles up to 60 s, resets on success
+- **`/ram` command** — shows total / used / available RAM and swap via `/proc/meminfo` (no extra dependencies)
+- **`collections.deque` queue list** — O(1) append/remove vs the previous O(n) list
+- **df result cached for 10 s** — `/status` no longer spawns a subprocess on every call
+- **Full traceback logging** in `queue_worker` — unhandled errors are printed with a full stack trace instead of silently disappearing
+- **`UPDATE_LOCK`** protecting `LAST_UPDATE_ID` — thread-safe update ID tracking
+- File size read once in `deliver_file` — avoids a redundant `os.path.getsize` call
+- `shutil.copyfileobj` for file splitting — avoids loading an entire 45 MB chunk into RAM
+
+### General
+- Both files versioned (`__version__` string) for easier change tracking
+- `_NULL_VALUES` frozenset in parser — faster membership test than tuple comparison
+
+---
+
 ## How Falcon Works
 
 Two-phase pipeline:
 
 **Phase 1 — Search**
-- Uses `ripgrep` if installed (preferred, much faster than pure Python)
-- Falls back to `ProcessPoolExecutor` pure-Python grep if `ripgrep` not available
+- Uses `ripgrep` if installed (preferred) with `--mmap`, `--no-unicode`, and `-j <cpus>` for maximum speed
+- Falls back to mmap-based `ProcessPoolExecutor` pure-Python grep if ripgrep is not available
 - Streams hits directly to a temp file on disk — **no RAM accumulation**
-- Deduplicates via `sort -u` (disk-based — handles any file size without RAM pressure)
+- Deduplicates via `sort -u --buffer-size=512M --parallel=<cpus>` (disk-based — handles any file size)
 - Output: `ULP_{term}.txt`
 
 **Phase 2 — Combo extraction**
 - Reads Phase 1 output, strips URL schemes / bracket prefixes / promo tails / mojibake
-- Extracts clean `user:pass` pairs using a multi-core `ProcessPoolExecutor`
+- Extracts clean `user:pass` pairs using a multi-core `ProcessPoolExecutor` with balanced chunk sizes
 - Deduplicates again via `sort -u`
 - Output: `COMBO_LP_{term}.txt`
 
@@ -90,6 +122,7 @@ Telegram bots have a **50 MB upload limit**. Falcon-TG handles this transparentl
 
 - Files **≤ 45 MB** → sent directly as a single document
 - Files **> 45 MB** → automatically split into 45 MB chunks and sent as numbered parts (e.g. `ULP_netflix.com.part1of5.txt`)
+- Splitting uses `shutil.copyfileobj` — no large RAM spike during chunking
 - If any part fails, you're told exactly which part and the full file path on the server
 
 ---
@@ -185,3 +218,4 @@ sudo systemctl status tg-private-bot
 - `ripgrep` (optional but strongly recommended: `sudo apt install ripgrep`)
 - GNU `sort` (pre-installed on all Linux distros)
 - `requests>=2.31.0`
+- `urllib3>=1.26.0` (included with requests)
