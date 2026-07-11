@@ -203,12 +203,3 @@ Leave a **GitHub trace** — open a GitHub issue titled `[TRACE] vX.X.X — YYYY
 - Backup filenames follow the pattern `bot.py.vX.X.X-YYYY-MM-DD` (no `.py` extension suffix)
 
 ---
-
-## CURRENT OPEN TODOs (as of v3.3.0)
-
-- [ ] True real-time inline search — stream results to Telegram as they arrive
-- [ ] Per-user search history persistence — currently in-memory only, lost on restart
-- [ ] Search result preview — first 3 lines shown directly in bot message before download
-- [ ] Scheduled auto-clean of archives older than N days
-- [ ] Admin broadcast command for multi-user setups
-- [ ] Web dashboard (optional, low priority)
