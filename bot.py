@@ -65,7 +65,9 @@ PYTHON_BIN       = os.environ.get("PYTHON_BIN", "python3")
 FALCON_SCRIPT    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "falcon_parse.py")
 
 API          = f"https://api.telegram.org/bot{TOKEN}"
-TG_MAX_BYTES = 45 * 1024 * 1024
+# TG_MAX_BYTES: maximum bytes per Telegram document part.
+# Override via TG_MAX_BYTES env-var (bytes). Default: 45 MB.
+TG_MAX_BYTES = int(os.environ.get("TG_MAX_BYTES", str(45 * 1024 * 1024)))
 
 # ── Progress bar calibration ──────────────────────────────────
 FULL_RUN_SECONDS  = 731.0
@@ -677,7 +679,21 @@ def handle_inline_query(inline_query_id, from_user_id, query):
 # ════════════════════════════════════════════════════════════
 # FILE DELIVERY
 # ════════════════════════════════════════════════════════════
+_SPLIT_CHUNK = 64 * 1024  # 64 KB read buffer for splitting
+
 def _split_and_send(chat_id, file_path, caption, msg_id):
+    """
+    Split *file_path* into sequential parts of at most TG_MAX_BYTES each
+    and upload every part as a Telegram document.
+
+    The old implementation used shutil.copyfileobj(src, dst, length=TG_MAX_BYTES)
+    inside a loop over parts.  That is wrong: copyfileobj's `length` parameter is
+    only the read-buffer size — it keeps reading until EOF regardless, so the
+    first part consumed the whole file and all later parts were empty.
+
+    The fix reads at most `remaining` bytes per part using a small chunk loop,
+    stopping each part file as soon as TG_MAX_BYTES have been written.
+    """
     file_size   = os.path.getsize(file_path)
     stem        = Path(file_path).stem
     ext         = Path(file_path).suffix
@@ -691,8 +707,14 @@ def _split_and_send(chat_id, file_path, caption, msg_id):
         with open(file_path, "rb") as src:
             for i in range(total_parts):
                 pname = tmp_dir / f"{stem}.part{i+1}of{total_parts}{ext}"
+                remaining = TG_MAX_BYTES
                 with open(pname, "wb") as dst:
-                    shutil.copyfileobj(src, dst, length=TG_MAX_BYTES)
+                    while remaining > 0:
+                        chunk = src.read(min(_SPLIT_CHUNK, remaining))
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                        remaining -= len(chunk)
                 part_paths.append(pname)
     except Exception as e:
         edit_message(chat_id, msg_id, f"❌  Failed to split: {e}")
