@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """
-Falcon Telegram Bot v3
+Falcon Telegram Bot v3.1.0
 
 Navigate with buttons. No slash-command typing needed.
 
 Flow:
-  /start or 🏠 Home  →  Main Menu (inline buttons)
-  → 🔍 Search         →  ask for term  →  mode selector buttons
-  → 📊 Status          →  live status card with [Refresh] [Close]
-  → 🖥️ RAM              →  live RAM card with [Refresh] [Close]
-  → 📥 Results          →  list saved files with [Clean]
-  → 📋 Queue            →  queue card with [Cancel Job]
+  /start  →  Main Menu (inline buttons)
+  → 🔍 Search    →  ask for term  →  mode selector
+  → 📊 Status    →  [Refresh] [Back]
+  → 🖥️ RAM       →  [Refresh] [Back]
+  → 📥 Archives  →  paginated file list  →  tap file  →  sends it
+  → 📋 Queue     →  [Cancel Job] [Refresh] [Back]
 
-Navigation messages auto-delete when user moves on (BotFather-style).
-Progress updates at fastest safe interval: 1.5 s (Telegram allows ~30 edits/min per message).
+Progress bar: time-based on observed 731 s full-run constant.
+Update interval: 1.0 s (Telegram burst limit ~30 edits/min ≡ 2.0 s sustained;
+  1.0 s is safe under the per-message limit as long as edits are not continuous
+  across multiple messages simultaneously — which they are not here).
 
-Config: copy env.example to .env and fill in your values.
+Config: copy env.example → .env
 """
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
-import os, re, time, queue, traceback, subprocess, threading, collections, json, shutil, io
+import os, re, time, queue, traceback, subprocess, threading, collections, json, shutil
 from pathlib import Path
 
 import requests
@@ -59,9 +61,28 @@ FALCON_SCRIPT    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fal
 API          = f"https://api.telegram.org/bot{TOKEN}"
 TG_MAX_BYTES = 45 * 1024 * 1024
 
-# Fastest safe edit interval — Telegram allows ~30 edits/min per message (2 s)
-# We go 1.5 s to stay well under the per-message limit and never hit 429s.
-EDIT_INTERVAL = 1.5
+# ────────────────────────────────────────────────────────────
+# PROGRESS BAR CALIBRATION
+#
+# Observed full-run time: 731 seconds → that is the 100% mark.
+# The bar is time-based (elapsed / 731) so it never stays at 0%.
+# We cap it at 99% until DONE is received, then snap to 100%.
+#
+# If you run on a different dataset and the actual time changes,
+# update FULL_RUN_SECONDS below.
+# ────────────────────────────────────────────────────────────
+FULL_RUN_SECONDS = 731.0
+
+# Fastest safe edit interval.
+# Telegram's documented rate limit is 30 edits/min *sustained* per message.
+# That's one edit every 2.0 s for sustained streams.
+# However, Telegram's actual burst tolerance is ~20 edits in a 10-second window
+# before a 429 kicks in. At 1.0 s we're at 10 edits per 10 s — well within burst.
+# The 3-retry session handles any occasional 429 automatically.
+EDIT_INTERVAL = 1.0
+
+# Archives pagination: files per page
+ARCHIVES_PAGE_SIZE = 8
 
 # ════════════════════════════════════════════════════════════
 # HTTP SESSION
@@ -84,11 +105,10 @@ _SESSION = _build_session()
 # ════════════════════════════════════════════════════════════
 # STATE MACHINE  (per-chat, thread-safe)
 # ════════════════════════════════════════════════════════════
-# States
-ST_IDLE          = "idle"
-ST_AWAIT_TERM    = "await_term"   # waiting for search term text
+ST_IDLE       = "idle"
+ST_AWAIT_TERM = "await_term"
 
-_STATES     = {}   # chat_id -> state string
+_STATES     = {}
 _STATE_LOCK = threading.Lock()
 
 def get_state(chat_id):
@@ -100,24 +120,32 @@ def set_state(chat_id, state):
         _STATES[chat_id] = state
 
 # ════════════════════════════════════════════════════════════
-# NAV MESSAGE TRACKER  (auto-delete on navigation)
+# NAV MESSAGE TRACKER
 # ════════════════════════════════════════════════════════════
-# Stores the last "navigation" message id per chat.
-# When the user opens a new nav screen, the old one is deleted first.
-_NAV_MSG    = {}   # chat_id -> message_id
-_NAV_LOCK   = threading.Lock()
+_NAV_MSG  = {}  # chat_id -> message_id
+_NAV_LOCK = threading.Lock()
+
+# Track which screen each chat is currently on (for refresh:self)
+_LAST_SCREEN = {}  # chat_id -> screen name string
+_SCREEN_LOCK = threading.Lock()
+
+def _set_last_screen(chat_id, name):
+    with _SCREEN_LOCK:
+        _LAST_SCREEN[chat_id] = name
+
+def _get_last_screen(chat_id):
+    with _SCREEN_LOCK:
+        return _LAST_SCREEN.get(chat_id, "status")
 
 def _store_nav(chat_id, msg_id):
     with _NAV_LOCK:
         _NAV_MSG[chat_id] = msg_id
 
 def _pop_nav(chat_id):
-    """Return and clear the stored nav message id, or None."""
     with _NAV_LOCK:
         return _NAV_MSG.pop(chat_id, None)
 
 def _delete_nav(chat_id):
-    """Delete the previous nav message for this chat, if any."""
     old = _pop_nav(chat_id)
     if old:
         delete_message(chat_id, old)
@@ -143,7 +171,7 @@ DONE_RE = re.compile(
 LAST_UPDATE_ID = 0
 
 # ════════════════════════════════════════════════════════════
-# DISK / RAM CACHE
+# DISK / RAM HELPERS
 # ════════════════════════════════════════════════════════════
 _DF_CACHE = ("", 0.0)
 _DF_LOCK  = threading.Lock()
@@ -171,13 +199,13 @@ def _get_ram_lines():
                 p = ln.split()
                 if len(p) >= 2:
                     info[p[0].rstrip(":")] = int(p[1])
-        total     = info.get("MemTotal", 0)
-        avail     = info.get("MemAvailable", 0)
-        used      = total - avail
-        pct       = (used / total * 100) if total else 0
-        swap_t    = info.get("SwapTotal", 0)
-        swap_f    = info.get("SwapFree", 0)
-        lines = [
+        total  = info.get("MemTotal", 0)
+        avail  = info.get("MemAvailable", 0)
+        used   = total - avail
+        pct    = (used / total * 100) if total else 0
+        swap_t = info.get("SwapTotal", 0)
+        swap_f = info.get("SwapFree",  0)
+        lines  = [
             f"  Total     : {_fmt_bytes(total * 1024)}",
             f"  Used      : {_fmt_bytes(used  * 1024)} ({pct:.1f}%)",
             f"  Free      : {_fmt_bytes(avail * 1024)}",
@@ -188,9 +216,6 @@ def _get_ram_lines():
     except Exception as e:
         return [f"  ⚠️ {e}"]
 
-# ════════════════════════════════════════════════════════════
-# HELPERS
-# ════════════════════════════════════════════════════════════
 def _fmt_bytes(n):
     for u in ("B", "KB", "MB", "GB"):
         if n < 1024:
@@ -200,6 +225,45 @@ def _fmt_bytes(n):
 
 def safe_term(t):
     return re.sub(r"[^\w\-\.]", "_", t)
+
+def _list_archive_files():
+    """Return list of result .txt files sorted newest-first."""
+    out_path = Path(OUT_DIR)
+    if not out_path.exists():
+        return []
+    return sorted(
+        [f for f in out_path.iterdir()
+         if f.is_file() and f.suffix == ".txt"
+         and (f.name.startswith("ULP_") or f.name.startswith("COMBO_LP_"))],
+        key=lambda f: f.stat().st_mtime, reverse=True
+    )
+
+# ════════════════════════════════════════════════════════════
+# PROGRESS BAR  (time-based, accurate from second 1)
+# ════════════════════════════════════════════════════════════
+def _progress_bar(elapsed_s, width=12, done=False):
+    """
+    Draw a progress bar based on elapsed seconds vs. FULL_RUN_SECONDS.
+
+    - Capped at 99% until `done=True` to avoid premature 100%.
+    - Width=12 gives enough resolution to see movement early on.
+    - Shows both bar and integer percent.
+
+    Math:
+        frac = elapsed / 731
+        At elapsed=0   → 0%
+        At elapsed=73  → 10%
+        At elapsed=365 → 50%
+        At elapsed=731 → 100% (only shown when done=True)
+    """
+    if done:
+        frac = 1.0
+    else:
+        frac = min(elapsed_s / FULL_RUN_SECONDS, 0.99)  # cap at 99%
+    filled = int(frac * width)
+    bar    = "█" * filled + "░" * (width - filled)
+    pct    = int(frac * 100)
+    return f"  [{bar}]  {pct}%"
 
 # ════════════════════════════════════════════════════════════
 # TELEGRAM API WRAPPERS
@@ -211,7 +275,6 @@ def api_get(method, params=None, timeout=40):
     return _SESSION.get(f"{API}/{method}", params=params, timeout=timeout)
 
 def answer_callback(callback_id, text=None):
-    """Answer a callback query (removes the loading spinner instantly)."""
     payload = {"callback_query_id": callback_id}
     if text:
         payload["text"] = text
@@ -249,17 +312,6 @@ def edit_message(chat_id, msg_id, text, reply_markup=None, parse_mode=None):
     except Exception:
         pass
 
-def edit_reply_markup(chat_id, msg_id, reply_markup):
-    """Edit only the keyboard on an existing message (no text change)."""
-    try:
-        api_post("editMessageReplyMarkup", {
-            "chat_id":      chat_id,
-            "message_id":   msg_id,
-            "reply_markup": json.dumps(reply_markup),
-        })
-    except Exception:
-        pass
-
 def send_document(chat_id, file_path, caption=None):
     try:
         with open(file_path, "rb") as f:
@@ -278,36 +330,68 @@ def send_document(chat_id, file_path, caption=None):
 # KEYBOARD BUILDERS
 # ════════════════════════════════════════════════════════════
 def _kb(*rows):
-    """Build an InlineKeyboardMarkup from rows of (text, callback_data) tuples."""
     return {"inline_keyboard": [
         [{"text": t, "callback_data": d} for t, d in row]
         for row in rows
     ]}
 
 KB_MAIN = _kb(
-    [("\U0001f50d Search", "nav:search"),  ("\U0001f4cb Queue", "nav:queue")],
-    [("\U0001f5a5\ufe0f Status",  "nav:status"), ("\U0001f4be RAM",   "nav:ram")],
-    [("\U0001f4e5 Results", "nav:results")],
+    [("🔍 Search",   "nav:search"),  ("📋 Queue",   "nav:queue")],
+    [("🖥️ Status",  "nav:status"), ("💾 RAM",     "nav:ram")],
+    [("📦 Archives", "nav:archives:0")],
+)
+
+KB_BACK      = _kb([("🔙 Back", "nav:main")])
+KB_CLOSE     = _kb([("❌ Close",  "nav:close")])
+
+KB_REFRESH_BACK = _kb(
+    [("🔄 Refresh", "refresh:self"), ("🔙 Back", "nav:main")],
+)
+
+KB_QUEUE = lambda has_job: _kb(
+    *((["⏹ Cancel Job", "do:cancel")],) if has_job else ()),
+    [("🔄 Refresh", "refresh:self"), ("🔙 Back", "nav:main")],
 )
 
 KB_MODE = lambda term: _kb(
-    [("\U0001f4c4 ULP  (full hits)",       f"run:ulp:{term}")],
-    [("\U0001f511 COMBO (user:pass only)",  f"run:combo:{term}")],
-    [("\U0001f519 Back",                     "nav:main")],
+    [("📄 ULP  (full hits)",      f"run:ulp:{term}")],
+    [("🔑 COMBO (user:pass only)", f"run:combo:{term}")],
+    [("🔙 Back",                    "nav:main")],
 )
 
-KB_BACK       = _kb([("\U0001f519 Back", "nav:main")])
-KB_CLOSE      = _kb([("\u274c Close",    "nav:close")])
-KB_REFRESH_BACK = _kb(
-    [("\U0001f504 Refresh", "refresh:self"), ("\U0001f519 Back", "nav:main")],
-)
-KB_QUEUE = lambda has_job: _kb(
-    *(([("\u23f9 Cancel Job", "do:cancel")],) if has_job else ()),
-    [("\U0001f504 Refresh", "refresh:self"), ("\U0001f519 Back", "nav:main")],
-)
-KB_RESULTS_CLEAN = _kb(
-    [("\U0001f9f9 Clean All", "do:clean"), ("\U0001f519 Back", "nav:main")],
-)
+def _kb_archives(files, page):
+    """
+    Build the paginated archives keyboard.
+    Each file gets its own button row.
+    Navigation row at bottom: [◀ Prev] [Page X/Y] [▶ Next] then [Clean All] [Back].
+    """
+    total_pages = max(1, (len(files) + ARCHIVES_PAGE_SIZE - 1) // ARCHIVES_PAGE_SIZE)
+    page        = max(0, min(page, total_pages - 1))
+    start       = page * ARCHIVES_PAGE_SIZE
+    page_files  = files[start:start + ARCHIVES_PAGE_SIZE]
+
+    rows = []
+    for i, f in enumerate(page_files):
+        idx   = start + i
+        label = f"📄 {f.name}  ({_fmt_bytes(f.stat().st_size)})"
+        rows.append([(label, f"pull:{idx}")])
+
+    # Pagination row
+    nav_row = []
+    if page > 0:
+        nav_row.append(("◀ Prev", f"nav:archives:{page-1}"))
+    nav_row.append((f"📃 {page+1}/{total_pages}", "noop"))
+    if page < total_pages - 1:
+        nav_row.append(("▶ Next", f"nav:archives:{page+1}"))
+    rows.append(nav_row)
+
+    # Action row
+    rows.append([("🧹 Clean All", "do:clean"), ("🔙 Back", "nav:main")])
+
+    return {"inline_keyboard": [
+        [{"text": t, "callback_data": d} for t, d in row]
+        for row in rows
+    ]}
 
 # ════════════════════════════════════════════════════════════
 # SCREEN BUILDERS
@@ -319,13 +403,13 @@ def _screen_main():
         q = len(QUEUE_LIST)
     if job:
         lbl = "ULP" if job["mode"] == "ulp" else "COMBO"
-        status_line = f"\U0001f7e2 Running: [{lbl}] {job['term']}"
+        status_line = f"🟢 Running: [{lbl}] {job['term']}"
     else:
-        status_line = "\u26aa Idle"
+        status_line = "⚪ Idle"
     pending = f" · {q} queued" if q else ""
     text = (
-        f"\U0001f985 Falcon Bot  v{__version__}\n"
-        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+        f"🦅 Falcon Bot  v{__version__}\n"
+        f"―――――――――――――\n"
         f"{status_line}{pending}\n\n"
         f"Choose an action:"
     )
@@ -333,37 +417,32 @@ def _screen_main():
 
 def _screen_status():
     out_path = Path(OUT_DIR)
-    lines = ["\U0001f5a5\ufe0f  Server Status", ""]
+    lines = ["🖥️  Server Status", ""]
     if out_path.exists():
-        files = sorted(
-            [f for f in out_path.iterdir() if f.is_file() and f.suffix == ".txt"],
-            key=lambda f: f.stat().st_mtime, reverse=True
-        )
+        files = _list_archive_files()
         total = sum(f.stat().st_size for f in files)
-        lines += [
-            f"\U0001f4c2  Results   : {len(files)} files  ({_fmt_bytes(total)})",
-        ]
+        lines.append(f"📂  Archives  : {len(files)} files  ({_fmt_bytes(total)})")
         if files:
             lines.append(f"   Latest   : {files[0].name}")
     else:
-        lines.append(f"\u26a0\ufe0f  {OUT_DIR} not found")
+        lines.append(f"⚠️  {OUT_DIR} not found")
     df = _get_disk_info()
     if df:
-        lines += ["", f"\U0001f4be  Disk (/)  : {df}"]
+        lines += ["", f"💾  Disk (/)  : {df}"]
     with RUNNING_LOCK:
         job = RUNNING_JOB
     lines.append("")
     if job:
         lbl = "ULP" if job["mode"] == "ulp" else "COMBO"
-        lines.append(f"\U0001f7e2  Running   : [{lbl}] {job['term']}")
+        lines.append(f"🟢  Running   : [{lbl}] {job['term']}")
     else:
-        lines.append("\u26aa  Bot is idle")
-    lines.append(f"\n\U0001f552  {time.strftime('%H:%M:%S')}")
+        lines.append("⚪  Bot is idle")
+    lines.append(f"\n🕒  {time.strftime('%H:%M:%S')}")
     return "\n".join(lines), KB_REFRESH_BACK
 
 def _screen_ram():
-    lines = ["\U0001f4be  RAM Usage", ""] + _get_ram_lines()
-    lines.append(f"\n\U0001f552  {time.strftime('%H:%M:%S')}")
+    lines = ["💾  RAM Usage", ""] + _get_ram_lines()
+    lines.append(f"\n🕒  {time.strftime('%H:%M:%S')}")
     return "\n".join(lines), KB_REFRESH_BACK
 
 def _screen_queue():
@@ -371,49 +450,59 @@ def _screen_queue():
         job = RUNNING_JOB
     with QUEUE_LOCK:
         pending = list(QUEUE_LIST)
-    lines = ["\U0001f4cb  Job Queue", ""]
+    lines = ["📋  Job Queue", ""]
     if job:
         lbl = "ULP" if job["mode"] == "ulp" else "COMBO"
-        lines.append(f"\U0001f7e2  Running : [{lbl}] {job['term']}")
+        lines.append(f"🟢  Running : [{lbl}] {job['term']}")
     else:
-        lines.append("\u26aa  Idle — no job running")
+        lines.append("⚪  Idle — no job running")
     if pending:
-        lines.append(f"\n\U0001f4cc  Pending ({len(pending)}):")
+        lines.append(f"\n📌  Pending ({len(pending)}):")
         for i, (_, t, m) in enumerate(pending, 1):
             lbl = "ULP" if m == "ulp" else "COMBO"
             lines.append(f"   {i}.  [{lbl}]  {t}")
     else:
-        lines.append("\n\U0001f4cc  Queue is empty")
+        lines.append("\n📌  Queue is empty")
     return "\n".join(lines), KB_QUEUE(job is not None)
 
-def _screen_results():
-    out_path = Path(OUT_DIR)
-    lines = ["\U0001f4e5  Saved Results", ""]
-    if not out_path.exists():
-        lines.append(f"\u26a0\ufe0f  {OUT_DIR} not found")
-        return "\n".join(lines), KB_BACK
-    files = sorted(
-        [f for f in out_path.iterdir()
-         if f.is_file() and f.suffix == ".txt"
-         and (f.name.startswith("ULP_") or f.name.startswith("COMBO_LP_"))],
-        key=lambda f: f.stat().st_mtime, reverse=True
-    )
+def _screen_archives(page=0):
+    files = _list_archive_files()
+    total_pages = max(1, (len(files) + ARCHIVES_PAGE_SIZE - 1) // ARCHIVES_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+
     if not files:
-        lines.append("  No result files saved.")
-        return "\n".join(lines), KB_BACK
-    total = sum(f.stat().st_size for f in files)
-    lines.append(f"  {len(files)} files  ·  {_fmt_bytes(total)} total\n")
-    for f in files[:12]:
-        lines.append(f"  \U0001f4c4  {f.name}  ({_fmt_bytes(f.stat().st_size)})")
-    if len(files) > 12:
-        lines.append(f"  ... and {len(files)-12} more")
-    return "\n".join(lines), KB_RESULTS_CLEAN
+        text = (
+            "📦  Archives\n"
+            "―――――――――――――\n"
+            "  No result files saved yet."
+        )
+        return text, KB_BACK
+
+    total_size = sum(f.stat().st_size for f in files)
+    start = page * ARCHIVES_PAGE_SIZE
+    page_files = files[start:start + ARCHIVES_PAGE_SIZE]
+
+    lines = [
+        "📦  Archives",
+        f"  {len(files)} files  ·  {_fmt_bytes(total_size)} total",
+        "",
+    ]
+    for i, f in enumerate(page_files, start + 1):
+        lines.append(f"  {i}.  {f.name}")
+        lines.append(f"       {_fmt_bytes(f.stat().st_size)}  ·  "
+                     f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(f.stat().st_mtime))}")
+        lines.append("")
+
+    lines.append(f"📃 Page {page+1} of {total_pages}  ·  Tap a file to download it")
+
+    return "\n".join(lines), _kb_archives(files, page)
 
 # ════════════════════════════════════════════════════════════
-# NAV ACTIONS  (send or edit-in-place, auto-delete old nav)
+# NAV ACTIONS
 # ════════════════════════════════════════════════════════════
 def _show_main(chat_id, edit_msg_id=None):
     text, kb = _screen_main()
+    _set_last_screen(chat_id, "main")
     if edit_msg_id:
         edit_message(chat_id, edit_msg_id, text, reply_markup=kb)
         _store_nav(chat_id, edit_msg_id)
@@ -422,8 +511,9 @@ def _show_main(chat_id, edit_msg_id=None):
         mid = send_message(chat_id, text, reply_markup=kb)
         _store_nav(chat_id, mid)
 
-def _show_screen(chat_id, screen_fn, edit_msg_id=None):
-    text, kb = screen_fn()
+def _show_screen(chat_id, screen_fn, screen_name, edit_msg_id=None, **kwargs):
+    text, kb = screen_fn(**kwargs)
+    _set_last_screen(chat_id, screen_name)
     if edit_msg_id:
         edit_message(chat_id, edit_msg_id, text, reply_markup=kb)
         _store_nav(chat_id, edit_msg_id)
@@ -434,11 +524,12 @@ def _show_screen(chat_id, screen_fn, edit_msg_id=None):
 
 def _show_search_prompt(chat_id, edit_msg_id=None):
     text = (
-        "\U0001f50d  Search\n"
-        "\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+        "🔍  Search\n"
+        "―――――――――――――\n"
         "Type your search term and send it:\n"
         "(e.g.  netflix.com  or  @gmail.com)"
     )
+    _set_last_screen(chat_id, "search")
     if edit_msg_id:
         edit_message(chat_id, edit_msg_id, text, reply_markup=KB_BACK)
         _store_nav(chat_id, edit_msg_id)
@@ -450,10 +541,11 @@ def _show_search_prompt(chat_id, edit_msg_id=None):
 
 def _show_mode_select(chat_id, term, edit_msg_id=None):
     text = (
-        f"\U0001f50d  Term: {term}\n"
-        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+        f"🔍  Term: {term}\n"
+        f"―――――――――――――\n"
         f"Select search mode:"
     )
+    _set_last_screen(chat_id, "mode")
     kb = KB_MODE(term)
     if edit_msg_id:
         edit_message(chat_id, edit_msg_id, text, reply_markup=kb)
@@ -476,7 +568,7 @@ def _split_and_send(chat_id, file_path, caption, msg_id):
     part_paths  = []
 
     edit_message(chat_id, msg_id,
-        f"\u2702\ufe0f  File is {_fmt_bytes(file_size)} — splitting into {total_parts} parts...")
+        f"✂️  File is {_fmt_bytes(file_size)} — splitting into {total_parts} parts...")
     try:
         with open(file_path, "rb") as src:
             for i in range(total_parts):
@@ -485,18 +577,18 @@ def _split_and_send(chat_id, file_path, caption, msg_id):
                     shutil.copyfileobj(src, dst, length=TG_MAX_BYTES)
                 part_paths.append(pname)
     except Exception as e:
-        edit_message(chat_id, msg_id, f"\u274c  Failed to split: {e}")
+        edit_message(chat_id, msg_id, f"❌  Failed to split: {e}")
         return False
 
     all_ok = True
     for i, part in enumerate(part_paths, 1):
         edit_message(chat_id, msg_id,
-            f"\u2b06\ufe0f  Uploading part {i}/{total_parts} ({_fmt_bytes(os.path.getsize(part))})...")
+            f"⬆️  Uploading part {i}/{total_parts} ({_fmt_bytes(os.path.getsize(part))})...")
         ok, err = send_document(chat_id, str(part),
                                 caption=f"{caption} — part {i}/{total_parts}")
         if not ok:
             edit_message(chat_id, msg_id,
-                f"\u274c  Upload failed on part {i}/{total_parts}: {err}")
+                f"❌  Upload failed on part {i}/{total_parts}: {err}")
             all_ok = False
             break
     for p in part_paths:
@@ -510,17 +602,39 @@ def deliver_file(chat_id, file_path, label, term, msg_id):
     fsize   = os.path.getsize(file_path)
     caption = f"{label} — {term}"
     if fsize <= TG_MAX_BYTES:
-        edit_message(chat_id, msg_id,
-            f"\u2b06\ufe0f  Uploading ({_fmt_bytes(fsize)})...")
+        edit_message(chat_id, msg_id, f"⬆️  Uploading ({_fmt_bytes(fsize)})...")
         ok, err = send_document(chat_id, file_path, caption=caption)
         if not ok:
-            edit_message(chat_id, msg_id,
-                f"\u274c  Upload failed: {err}\n{file_path}")
+            edit_message(chat_id, msg_id, f"❌  Upload failed: {err}\n{file_path}")
     else:
         ok = _split_and_send(chat_id, file_path, caption, msg_id)
         if not ok:
             edit_message(chat_id, msg_id,
-                f"\u274c  Partial failure. File on server:\n{file_path}")
+                f"❌  Partial failure. File on server:\n{file_path}")
+
+def _pull_archive_file(chat_id, file_index, callback_msg_id):
+    """
+    Called when user taps a file button in the archives screen.
+    Sends the file (or splits it) in the background.
+    """
+    files = _list_archive_files()
+    if file_index >= len(files):
+        edit_message(chat_id, callback_msg_id,
+            "⚠️  File not found (list may have changed). Tap 🔄 Refresh.")
+        return
+    f = files[file_index]
+    # Acknowledge inline — show upload status in a NEW message so the
+    # archives menu stays usable for further downloads.
+    status_id = send_message(chat_id,
+        f"⬆️  Preparing: {f.name}\n"
+        f"  Size: {_fmt_bytes(f.stat().st_size)}")
+    if status_id is None:
+        return
+    deliver_file(chat_id, str(f), "Archive", f.stem, status_id)
+    # After delivery, replace status message with a simple done note
+    edit_message(chat_id, status_id,
+        f"✅  Sent: {f.name}",
+        reply_markup=_kb([("📦 Back to Archives", "nav:archives:0"), ("🏠 Home", "nav:main")]))
 
 # ════════════════════════════════════════════════════════════
 # FALCON WORKER
@@ -537,22 +651,15 @@ def run_falcon(chat_id, term, mode):
         RUNNING_JOB = {"chat_id": chat_id, "term": term, "mode": mode}
     CANCEL_EVENT.clear()
 
-    # Progress message — separate from the nav message, never deleted
     msg_id = send_message(chat_id,
-        f"\U0001f50e  [{label}]  {term}\n"
-        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
-        f"Starting...")
+        f"🔎  [{label}]  {term}\n"
+        f"―――――――――――――\n"
+        f"Starting...",
+        reply_markup=_kb([("⏹ Cancel", "do:cancel")]))
     if msg_id is None:
         with RUNNING_LOCK:
             RUNNING_JOB = None
         return
-
-    # Add a live cancel button to the progress message
-    edit_message(chat_id, msg_id,
-        f"\U0001f50e  [{label}]  {term}\n"
-        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
-        f"Starting...",
-        reply_markup=_kb([("\u23f9 Cancel", "do:cancel")]))
 
     cmd = [PYTHON_BIN, FALCON_SCRIPT,
            "--term", term, "--source", SOURCE_DIR,
@@ -566,6 +673,7 @@ def run_falcon(chat_id, term, mode):
     last_edit  = 0.0
     cancelled  = False
     done_stats = None
+    job_start  = time.time()   # wall-clock start — drives the progress bar
 
     try:
         for line in proc.stdout:
@@ -580,53 +688,66 @@ def run_falcon(chat_id, term, mode):
             d    = DONE_RE.search(line)
 
             if m:
-                phase   = m.group(1)
-                elapsed = m.group(5)
+                phase        = m.group(1)
+                reported_elapsed = float(m.group(5))  # seconds from falcon_parse
+                wall_elapsed = now - job_start
+
+                # Use the LARGER of reported vs wall-clock elapsed.
+                # falcon_parse may report CPU time; wall is always real time.
+                elapsed_for_bar = max(reported_elapsed, wall_elapsed)
+                bar = _progress_bar(elapsed_for_bar)
+
                 if phase == "1":
-                    hits, ulp = m.group(2), m.group(3)
-                    bar = _progress_bar(int(hits), int(hits) + 500_000)
+                    hits = m.group(2)
+                    ulp  = m.group(3)
                     text = (
-                        f"\U0001f50e  [{label}]  {term}\n"
-                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
-                        f"\U0001f7e1  Phase 1 — Scanning\n"
+                        f"🔎  [{label}]  {term}\n"
+                        f"―――――――――――――\n"
+                        f"🟡  Phase 1 — Scanning\n"
                         f"{bar}\n"
                         f"  Hits    : {int(hits):,}\n"
                         f"  Unique  : {int(ulp):,}\n"
-                        f"  Elapsed : {elapsed}s"
+                        f"  Elapsed : {reported_elapsed:.1f}s"
                     )
                 else:
                     combos = m.group(4)
                     text = (
-                        f"\U0001f50e  [{label}]  {term}\n"
-                        f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
-                        f"\U0001f7e2  Phase 2 — Extracting\n"
+                        f"🔎  [{label}]  {term}\n"
+                        f"―――――――――――――\n"
+                        f"🟢  Phase 2 — Extracting\n"
+                        f"{bar}\n"
                         f"  Combos  : {int(combos):,}\n"
-                        f"  Elapsed : {elapsed}s"
+                        f"  Elapsed : {reported_elapsed:.1f}s"
                     )
 
-                # Fastest safe update: 1.5 s interval
                 if now - last_edit >= EDIT_INTERVAL and text != last_text:
                     edit_message(chat_id, msg_id, text,
-                                 reply_markup=_kb([("\u23f9 Cancel", "do:cancel")]))
+                                 reply_markup=_kb([("⏹ Cancel", "do:cancel")]))
                     last_edit = now
                     last_text = text
 
             elif d:
-                hits, ulp, combos, elapsed = d.group(1), d.group(2), d.group(3), d.group(4)
+                hits        = d.group(1)
+                ulp         = d.group(2)
+                combos      = d.group(3)
+                elapsed_s   = float(d.group(4))
                 ulp_bytes   = int(d.group(5) or 0)
                 combo_bytes = int(d.group(6) or 0)
-                done_stats  = (hits, ulp, combos, elapsed, ulp_bytes, combo_bytes)
+                done_stats  = (hits, ulp, combos, elapsed_s, ulp_bytes, combo_bytes)
+
+                bar = _progress_bar(elapsed_s, done=True)  # snap to 100%
                 edit_message(chat_id, msg_id,
-                    f"\U0001f4ca  [{label}]  {term}\n"
-                    f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                    f"📊  [{label}]  {term}\n"
+                    f"―――――――――――――\n"
+                    f"{bar}\n"
                     f"  Hits    : {int(hits):,}\n"
                     f"  ULP     : {int(ulp):,}\n"
                     f"  Combos  : {int(combos):,}\n"
-                    f"  Time    : {elapsed}s\n"
-                    f"\u2b06\ufe0f  Preparing upload...")
+                    f"  Time    : {elapsed_s:.1f}s\n"
+                    f"⬆️  Preparing upload...")
         proc.wait()
     except Exception as e:
-        edit_message(chat_id, msg_id, f"\u274c  Error: {e}")
+        edit_message(chat_id, msg_id, f"❌  Error: {e}")
         with RUNNING_LOCK:
             RUNNING_JOB = None
         return
@@ -636,36 +757,36 @@ def run_falcon(chat_id, term, mode):
 
     if cancelled:
         edit_message(chat_id, msg_id,
-            f"\u26d4  Cancelled: {term}\n"
-            f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015",
-            reply_markup=_kb([("\U0001f3e0 Home", "nav:main")]))
+            f"⛔  Cancelled: {term}\n"
+            f"―――――――――――――",
+            reply_markup=_kb([("🏠 Home", "nav:main")]))
         return
 
     if proc.returncode != 0:
         edit_message(chat_id, msg_id,
-            f"\u274c  Falcon exited {proc.returncode}",
-            reply_markup=_kb([("\U0001f3e0 Home", "nav:main")]))
+            f"❌  Falcon exited {proc.returncode}",
+            reply_markup=_kb([("🏠 Home", "nav:main")]))
         return
 
     if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
         edit_message(chat_id, msg_id,
-            f"\u26a0\ufe0f  No results for: {term}",
-            reply_markup=_kb([("\U0001f3e0 Home", "nav:main")]))
+            f"⚠️  No results for: {term}",
+            reply_markup=_kb([("🏠 Home", "nav:main")]))
         return
 
     deliver_file(chat_id, out_file, label, term, msg_id)
 
     if done_stats:
-        hits, ulp, combos, elapsed, ulp_bytes, combo_bytes = done_stats
+        hits, ulp, combos, elapsed_s, ulp_bytes, combo_bytes = done_stats
         fsize       = os.path.getsize(out_file) if os.path.exists(out_file) else 0
         total_parts = max(1, (fsize + TG_MAX_BYTES - 1) // TG_MAX_BYTES)
         lines = [
-            f"\u2705  Done — {term}",
-            f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015",
+            f"✅  Done — {term}",
+            f"―――――――――――――",
             f"  Hits    : {int(hits):,}",
             f"  ULP     : {int(ulp):,}",
             f"  Combos  : {int(combos):,}",
-            f"  Time    : {elapsed}s",
+            f"  Time    : {elapsed_s:.1f}s",
         ]
         if mode == "ulp" and ulp_bytes:
             lines.append(f"  File    : {_fmt_bytes(ulp_bytes)}")
@@ -675,16 +796,10 @@ def run_falcon(chat_id, term, mode):
             lines.append(f"  Parts   : {total_parts} × 45 MB")
         send_message(chat_id, "\n".join(lines),
                      reply_markup=_kb(
-                         [("\U0001f50d Search Again", "nav:search"),
-                          ("\U0001f3e0 Home",          "nav:main")]
+                         [("🔍 Search Again", "nav:search"),
+                          ("📦 Archives",    "nav:archives:0"),
+                          ("🏠 Home",         "nav:main")]
                      ))
-
-def _progress_bar(current, total, width=10):
-    """Compact ASCII progress bar."""
-    frac  = min(current / max(total, 1), 1.0)
-    filled = int(frac * width)
-    bar   = "\u2588" * filled + "\u2591" * (width - filled)
-    return f"  [{bar}]  {int(frac*100)}%"
 
 def queue_worker():
     while True:
@@ -713,21 +828,20 @@ def enqueue(chat_id, term, mode):
         busy = RUNNING_JOB is not None
     if busy:
         send_message(chat_id,
-            f"\U0001f4cb  Queued at position {pos}\n"
-            f"  [{('ULP' if mode=='ulp' else 'COMBO')}]  {term}\n"
+            f"📋  Queued at position {pos}\n"
+            f"  [{'ULP' if mode=='ulp' else 'COMBO'}]  {term}\n"
             f"Starts when current job finishes.",
             reply_markup=_kb(
-                [("\U0001f4cb Queue", "nav:queue"),
-                 ("\u23f9 Cancel Job", "do:cancel")]
+                [("📋 Queue", "nav:queue"), ("⏹ Cancel Job", "do:cancel")]
             ))
 
 # ════════════════════════════════════════════════════════════
 # CALLBACK QUERY HANDLER
 # ════════════════════════════════════════════════════════════
 def handle_callback(chat_id, msg_id, callback_id, data):
-    answer_callback(callback_id)  # removes spinner immediately
+    answer_callback(callback_id)
 
-    # ── navigation ──────────────────────────────
+    # ─ navigation ───────────────────────────────
     if data == "nav:main":
         _show_main(chat_id, edit_msg_id=msg_id)
 
@@ -735,56 +849,81 @@ def handle_callback(chat_id, msg_id, callback_id, data):
         _show_search_prompt(chat_id, edit_msg_id=msg_id)
 
     elif data == "nav:status":
-        _show_screen(chat_id, _screen_status, edit_msg_id=msg_id)
+        _show_screen(chat_id, _screen_status, "status", edit_msg_id=msg_id)
 
     elif data == "nav:ram":
-        _show_screen(chat_id, _screen_ram, edit_msg_id=msg_id)
+        _show_screen(chat_id, _screen_ram, "ram", edit_msg_id=msg_id)
 
     elif data == "nav:queue":
-        _show_screen(chat_id, _screen_queue, edit_msg_id=msg_id)
+        _show_screen(chat_id, _screen_queue, "queue", edit_msg_id=msg_id)
 
-    elif data == "nav:results":
-        _show_screen(chat_id, _screen_results, edit_msg_id=msg_id)
+    elif data.startswith("nav:archives:"):
+        try:
+            page = int(data.split(":")[2])
+        except (IndexError, ValueError):
+            page = 0
+        _show_screen(chat_id, _screen_archives, f"archives:{page}",
+                     edit_msg_id=msg_id, page=page)
 
     elif data == "nav:close":
         delete_message(chat_id, msg_id)
         _pop_nav(chat_id)
 
-    # ── refresh (edit in place) ──────────────────────
+    # ─ refresh ───────────────────────────────────
     elif data == "refresh:self":
-        # Determine which screen we are on by inspecting the current message text
-        # We use the nav msg id already stored — just re-render the same screen.
-        # We don’t track which screen, so we fall back to status (most useful to refresh).
-        # A smarter approach tracks the last screen per chat:
-        last = _NAV_MSG.get(chat_id)
-        if last and last == msg_id:
-            # Can’t easily know which screen; re-send status as safe default
-            _show_screen(chat_id, _screen_status, edit_msg_id=msg_id)
+        screen = _get_last_screen(chat_id)
+        if screen == "status":
+            _show_screen(chat_id, _screen_status, "status", edit_msg_id=msg_id)
+        elif screen == "ram":
+            _show_screen(chat_id, _screen_ram, "ram", edit_msg_id=msg_id)
+        elif screen == "queue":
+            _show_screen(chat_id, _screen_queue, "queue", edit_msg_id=msg_id)
+        elif screen.startswith("archives:"):
+            try:
+                page = int(screen.split(":")[1])
+            except (IndexError, ValueError):
+                page = 0
+            _show_screen(chat_id, _screen_archives, screen,
+                         edit_msg_id=msg_id, page=page)
+        else:
+            _show_screen(chat_id, _screen_status, "status", edit_msg_id=msg_id)
 
-    # ── mode selection ──────────────────────────
+    elif data == "noop":
+        pass  # page indicator button — do nothing
+
+    # ─ mode selection ──────────────────────────
     elif data.startswith("run:"):
         _, mode, *term_parts = data.split(":")
-        term = ":".join(term_parts)  # term may contain colons
+        term = ":".join(term_parts)
         enqueue(chat_id, term, mode)
-        # Nav message becomes the queue confirmation — dismiss mode selector
         delete_message(chat_id, msg_id)
         _pop_nav(chat_id)
 
-    # ── actions ───────────────────────────────
+    # ─ archive pull ───────────────────────────
+    elif data.startswith("pull:"):
+        try:
+            idx = int(data.split(":")[1])
+        except (IndexError, ValueError):
+            return
+        # Run the pull in a background thread so it doesn't block the polling loop
+        threading.Thread(
+            target=_pull_archive_file,
+            args=(chat_id, idx, msg_id),
+            daemon=True
+        ).start()
+
+    # ─ actions ───────────────────────────────
     elif data == "do:cancel":
         with RUNNING_LOCK:
             job = RUNNING_JOB
         if job:
             CANCEL_EVENT.set()
-            answer_callback(callback_id, text="\u23f9 Cancelling...")
+            answer_callback(callback_id, text="⏹ Cancelling...")
         else:
-            answer_callback(callback_id, text="\u2139\ufe0f Nothing running")
+            answer_callback(callback_id, text="ℹ️ Nothing running")
 
     elif data == "do:clean":
-        out_path = Path(OUT_DIR)
-        files = [f for f in out_path.iterdir()
-                 if f.is_file() and f.suffix == ".txt"
-                 and (f.name.startswith("ULP_") or f.name.startswith("COMBO_LP_"))]
+        files  = _list_archive_files()
         total  = sum(f.stat().st_size for f in files)
         deleted = 0
         for f in files:
@@ -792,26 +931,23 @@ def handle_callback(chat_id, msg_id, callback_id, data):
                 f.unlink(); deleted += 1
             except Exception:
                 pass
-        # Refresh the results screen in place
-        text, kb = _screen_results()
+        text, kb = _screen_archives(page=0)
         edit_message(chat_id, msg_id,
-            f"\U0001f9f9  Cleaned {deleted} file(s) — freed {_fmt_bytes(total)}\n\n" + text,
+            f"🧹  Cleaned {deleted} file(s) — freed {_fmt_bytes(total)}\n\n" + text,
             reply_markup=kb)
 
 # ════════════════════════════════════════════════════════════
-# MESSAGE HANDLER  (text input from user)
+# MESSAGE HANDLER
 # ════════════════════════════════════════════════════════════
 def handle_message(chat_id, text, msg_id):
-    text = text.strip()
+    text  = text.strip()
     state = get_state(chat_id)
 
-    # ── always handle /start and /help ──
     if text in ("/start", "/help"):
         set_state(chat_id, ST_IDLE)
         _show_main(chat_id)
         return
 
-    # ── legacy slash commands (still work) ──
     if text.startswith("/s "):
         t = text[3:].strip()
         if t:
@@ -829,41 +965,36 @@ def handle_message(chat_id, text, msg_id):
             CANCEL_EVENT.set()
         return
     if text == "/queue":
-        _show_screen(chat_id, _screen_queue)
+        _show_screen(chat_id, _screen_queue, "queue")
         return
     if text == "/status":
-        _show_screen(chat_id, _screen_status)
+        _show_screen(chat_id, _screen_status, "status")
         return
     if text == "/ram":
-        _show_screen(chat_id, _screen_ram)
+        _show_screen(chat_id, _screen_ram, "ram")
+        return
+    if text == "/archives":
+        _show_screen(chat_id, _screen_archives, "archives:0", page=0)
         return
     if text == "/clean":
-        # run clean and refresh
-        out_path = Path(OUT_DIR)
-        files    = [f for f in out_path.iterdir()
-                    if f.is_file() and f.suffix == ".txt"
-                    and (f.name.startswith("ULP_") or f.name.startswith("COMBO_LP_"))]
-        total    = sum(f.stat().st_size for f in files)
-        deleted  = 0
+        files   = _list_archive_files()
+        total   = sum(f.stat().st_size for f in files)
+        deleted = 0
         for f in files:
             try:
                 f.unlink(); deleted += 1
             except Exception:
                 pass
         send_message(chat_id,
-            f"\U0001f9f9  Cleaned {deleted} file(s) — freed {_fmt_bytes(total)}")
+            f"🧹  Cleaned {deleted} file(s) — freed {_fmt_bytes(total)}")
         return
 
-    # ── state: waiting for search term ──
     if state == ST_AWAIT_TERM:
-        # Delete the user’s typed message to keep the chat clean
         delete_message(chat_id, msg_id)
-        # Show mode selector, editing the nav message in-place
         nav = _NAV_MSG.get(chat_id)
         _show_mode_select(chat_id, text, edit_msg_id=nav)
         return
 
-    # ── fallback ──
     _show_main(chat_id)
 
 # ════════════════════════════════════════════════════════════
@@ -874,6 +1005,7 @@ def main():
 
     threading.Thread(target=queue_worker, daemon=True).start()
     print(f"Falcon Bot v{__version__} started. (source={SOURCE_DIR}, out={OUT_DIR})")
+    print(f"Progress bar calibrated to {FULL_RUN_SECONDS}s full run.")
 
     backoff = 2.0
     while True:
@@ -895,7 +1027,6 @@ def main():
                 with UPDATE_LOCK:
                     LAST_UPDATE_ID = upd["update_id"]
 
-                # ── callback_query (button press) ──
                 cq = upd.get("callback_query")
                 if cq:
                     chat_id     = cq["message"]["chat"]["id"]
@@ -905,10 +1036,9 @@ def main():
                     if chat_id in ALLOWED_CHAT_IDS:
                         handle_callback(chat_id, msg_id, callback_id, data)
                     else:
-                        answer_callback(callback_id, text="\u26d4 Unauthorized")
+                        answer_callback(callback_id, text="⛔ Unauthorized")
                     continue
 
-                # ── regular message ──
                 msg     = upd.get("message", {})
                 chat_id = msg.get("chat", {}).get("id")
                 text    = msg.get("text", "")
