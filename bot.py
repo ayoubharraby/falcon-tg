@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Falcon Telegram Bot v3.1.0
+Falcon Telegram Bot v3.1.1
 
 Navigate with buttons. No slash-command typing needed.
 
@@ -13,13 +13,11 @@ Flow:
   → 📋 Queue     →  [Cancel Job] [Refresh] [Back]
 
 Progress bar: time-based on observed 731 s full-run constant.
-Update interval: 1.0 s (Telegram burst limit ~30 edits/min ≡ 2.0 s sustained;
-  1.0 s is safe under the per-message limit as long as edits are not continuous
-  across multiple messages simultaneously — which they are not here).
+Update interval: 1.0 s (safe under Telegram burst limit).
 
 Config: copy env.example → .env
 """
-__version__ = "3.1.0"
+__version__ = "3.1.1"
 
 import os, re, time, queue, traceback, subprocess, threading, collections, json, shutil
 from pathlib import Path
@@ -67,17 +65,12 @@ TG_MAX_BYTES = 45 * 1024 * 1024
 # Observed full-run time: 731 seconds → that is the 100% mark.
 # The bar is time-based (elapsed / 731) so it never stays at 0%.
 # We cap it at 99% until DONE is received, then snap to 100%.
-#
-# If you run on a different dataset and the actual time changes,
-# update FULL_RUN_SECONDS below.
 # ────────────────────────────────────────────────────────────
 FULL_RUN_SECONDS = 731.0
 
 # Fastest safe edit interval.
-# Telegram's documented rate limit is 30 edits/min *sustained* per message.
-# That's one edit every 2.0 s for sustained streams.
-# However, Telegram's actual burst tolerance is ~20 edits in a 10-second window
-# before a 429 kicks in. At 1.0 s we're at 10 edits per 10 s — well within burst.
+# Telegram burst tolerance ≈ 20 edits / 10 s per message.
+# At 1.0 s we send 10 edits / 10 s — well under burst.
 # The 3-retry session handles any occasional 429 automatically.
 EDIT_INTERVAL = 1.0
 
@@ -126,7 +119,7 @@ _NAV_MSG  = {}  # chat_id -> message_id
 _NAV_LOCK = threading.Lock()
 
 # Track which screen each chat is currently on (for refresh:self)
-_LAST_SCREEN = {}  # chat_id -> screen name string
+_LAST_SCREEN = {}
 _SCREEN_LOCK = threading.Lock()
 
 def _set_last_screen(chat_id, name):
@@ -247,7 +240,6 @@ def _progress_bar(elapsed_s, width=12, done=False):
 
     - Capped at 99% until `done=True` to avoid premature 100%.
     - Width=12 gives enough resolution to see movement early on.
-    - Shows both bar and integer percent.
 
     Math:
         frac = elapsed / 731
@@ -259,7 +251,7 @@ def _progress_bar(elapsed_s, width=12, done=False):
     if done:
         frac = 1.0
     else:
-        frac = min(elapsed_s / FULL_RUN_SECONDS, 0.99)  # cap at 99%
+        frac = min(elapsed_s / FULL_RUN_SECONDS, 0.99)
     filled = int(frac * width)
     bar    = "█" * filled + "░" * (width - filled)
     pct    = int(frac * 100)
@@ -341,17 +333,22 @@ KB_MAIN = _kb(
     [("📦 Archives", "nav:archives:0")],
 )
 
-KB_BACK      = _kb([("🔙 Back", "nav:main")])
-KB_CLOSE     = _kb([("❌ Close",  "nav:close")])
-
+KB_BACK         = _kb([("🔙 Back", "nav:main")])
+KB_CLOSE        = _kb([("❌ Close",  "nav:close")])
 KB_REFRESH_BACK = _kb(
     [("🔄 Refresh", "refresh:self"), ("🔙 Back", "nav:main")],
 )
 
-KB_QUEUE = lambda has_job: _kb(
-    *((["⏹ Cancel Job", "do:cancel")],) if has_job else ()),
-    [("🔄 Refresh", "refresh:self"), ("🔙 Back", "nav:main")],
-)
+def _kb_queue(has_job):
+    """Queue screen keyboard — proper function to avoid lambda bracket issues."""
+    rows = []
+    if has_job:
+        rows.append([("⏹ Cancel Job", "do:cancel")])
+    rows.append([("🔄 Refresh", "refresh:self"), ("🔙 Back", "nav:main")])
+    return {"inline_keyboard": [
+        [{"text": t, "callback_data": d} for t, d in row]
+        for row in rows
+    ]}
 
 KB_MODE = lambda term: _kb(
     [("📄 ULP  (full hits)",      f"run:ulp:{term}")],
@@ -363,7 +360,7 @@ def _kb_archives(files, page):
     """
     Build the paginated archives keyboard.
     Each file gets its own button row.
-    Navigation row at bottom: [◀ Prev] [Page X/Y] [▶ Next] then [Clean All] [Back].
+    Navigation row: [◀ Prev] [Page X/Y] [▶ Next] then [Clean All] [Back].
     """
     total_pages = max(1, (len(files) + ARCHIVES_PAGE_SIZE - 1) // ARCHIVES_PAGE_SIZE)
     page        = max(0, min(page, total_pages - 1))
@@ -463,7 +460,7 @@ def _screen_queue():
             lines.append(f"   {i}.  [{lbl}]  {t}")
     else:
         lines.append("\n📌  Queue is empty")
-    return "\n".join(lines), KB_QUEUE(job is not None)
+    return "\n".join(lines), _kb_queue(job is not None)
 
 def _screen_archives(page=0):
     files = _list_archive_files()
@@ -623,15 +620,12 @@ def _pull_archive_file(chat_id, file_index, callback_msg_id):
             "⚠️  File not found (list may have changed). Tap 🔄 Refresh.")
         return
     f = files[file_index]
-    # Acknowledge inline — show upload status in a NEW message so the
-    # archives menu stays usable for further downloads.
     status_id = send_message(chat_id,
         f"⬆️  Preparing: {f.name}\n"
         f"  Size: {_fmt_bytes(f.stat().st_size)}")
     if status_id is None:
         return
     deliver_file(chat_id, str(f), "Archive", f.stem, status_id)
-    # After delivery, replace status message with a simple done note
     edit_message(chat_id, status_id,
         f"✅  Sent: {f.name}",
         reply_markup=_kb([("📦 Back to Archives", "nav:archives:0"), ("🏠 Home", "nav:main")]))
@@ -673,7 +667,7 @@ def run_falcon(chat_id, term, mode):
     last_edit  = 0.0
     cancelled  = False
     done_stats = None
-    job_start  = time.time()   # wall-clock start — drives the progress bar
+    job_start  = time.time()
 
     try:
         for line in proc.stdout:
@@ -688,14 +682,11 @@ def run_falcon(chat_id, term, mode):
             d    = DONE_RE.search(line)
 
             if m:
-                phase        = m.group(1)
-                reported_elapsed = float(m.group(5))  # seconds from falcon_parse
-                wall_elapsed = now - job_start
-
-                # Use the LARGER of reported vs wall-clock elapsed.
-                # falcon_parse may report CPU time; wall is always real time.
-                elapsed_for_bar = max(reported_elapsed, wall_elapsed)
-                bar = _progress_bar(elapsed_for_bar)
+                phase            = m.group(1)
+                reported_elapsed = float(m.group(5))
+                wall_elapsed     = now - job_start
+                elapsed_for_bar  = max(reported_elapsed, wall_elapsed)
+                bar              = _progress_bar(elapsed_for_bar)
 
                 if phase == "1":
                     hits = m.group(2)
@@ -735,7 +726,7 @@ def run_falcon(chat_id, term, mode):
                 combo_bytes = int(d.group(6) or 0)
                 done_stats  = (hits, ulp, combos, elapsed_s, ulp_bytes, combo_bytes)
 
-                bar = _progress_bar(elapsed_s, done=True)  # snap to 100%
+                bar = _progress_bar(elapsed_s, done=True)
                 edit_message(chat_id, msg_id,
                     f"📊  [{label}]  {term}\n"
                     f"―――――――――――――\n"
@@ -841,7 +832,7 @@ def enqueue(chat_id, term, mode):
 def handle_callback(chat_id, msg_id, callback_id, data):
     answer_callback(callback_id)
 
-    # ─ navigation ───────────────────────────────
+    # ─ navigation ───────────────────────────────────────────
     if data == "nav:main":
         _show_main(chat_id, edit_msg_id=msg_id)
 
@@ -869,7 +860,7 @@ def handle_callback(chat_id, msg_id, callback_id, data):
         delete_message(chat_id, msg_id)
         _pop_nav(chat_id)
 
-    # ─ refresh ───────────────────────────────────
+    # ─ refresh ──────────────────────────────────────────────
     elif data == "refresh:self":
         screen = _get_last_screen(chat_id)
         if screen == "status":
@@ -891,7 +882,7 @@ def handle_callback(chat_id, msg_id, callback_id, data):
     elif data == "noop":
         pass  # page indicator button — do nothing
 
-    # ─ mode selection ──────────────────────────
+    # ─ mode selection ───────────────────────────────────────
     elif data.startswith("run:"):
         _, mode, *term_parts = data.split(":")
         term = ":".join(term_parts)
@@ -899,20 +890,19 @@ def handle_callback(chat_id, msg_id, callback_id, data):
         delete_message(chat_id, msg_id)
         _pop_nav(chat_id)
 
-    # ─ archive pull ───────────────────────────
+    # ─ archive pull ─────────────────────────────────────────
     elif data.startswith("pull:"):
         try:
             idx = int(data.split(":")[1])
         except (IndexError, ValueError):
             return
-        # Run the pull in a background thread so it doesn't block the polling loop
         threading.Thread(
             target=_pull_archive_file,
             args=(chat_id, idx, msg_id),
             daemon=True
         ).start()
 
-    # ─ actions ───────────────────────────────
+    # ─ actions ──────────────────────────────────────────────
     elif data == "do:cancel":
         with RUNNING_LOCK:
             job = RUNNING_JOB
@@ -923,12 +913,13 @@ def handle_callback(chat_id, msg_id, callback_id, data):
             answer_callback(callback_id, text="ℹ️ Nothing running")
 
     elif data == "do:clean":
-        files  = _list_archive_files()
-        total  = sum(f.stat().st_size for f in files)
+        files   = _list_archive_files()
+        total   = sum(f.stat().st_size for f in files)
         deleted = 0
         for f in files:
             try:
-                f.unlink(); deleted += 1
+                f.unlink()
+                deleted += 1
             except Exception:
                 pass
         text, kb = _screen_archives(page=0)
@@ -982,7 +973,8 @@ def handle_message(chat_id, text, msg_id):
         deleted = 0
         for f in files:
             try:
-                f.unlink(); deleted += 1
+                f.unlink()
+                deleted += 1
             except Exception:
                 pass
         send_message(chat_id,
