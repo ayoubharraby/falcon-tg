@@ -1,223 +1,126 @@
-# falcon-tg
+# 🦅 Falcon Telegram Bot
 
-A private Telegram bot that runs **Falcon** — a fast credential-extraction engine — on a local dataset and delivers results directly in Telegram, with a **fully button-driven interface**, live progress, a job queue, cancel support, and smart large-file splitting.
-
----
-
-## Navigation (BotFather-style)
-
-The bot is fully navigated via **inline buttons**. You never need to type slash commands for normal use.
-
-```
-/start  →  Main Menu
-```
-
-```
-💅 Falcon Bot  v3.0.0
-―――――――――――――
-⚪ Idle
-
-Choose an action:
-
-[ 🔍 Search ]   [ 📋 Queue  ]
-[ 🖥️ Status ]   [ 💾 RAM    ]
-[ 📥 Results  ]
-```
-
-### Search flow
-
-1. Tap **🔍 Search** → bot asks for your term
-2. Type your term (e.g. `netflix.com`) → your message is auto-deleted, the nav message updates in-place
-3. **Mode selector** appears:
-
-```
-🔍  Term: netflix.com
-―――――――――――――
-Select search mode:
-
-[ 📄 ULP  (full hits)       ]
-[ 🔑 COMBO (user:pass only)  ]
-[ 🔙 Back                    ]
-```
-
-4. Tap a mode → mode selector disappears, search starts
-
-### Live progress
-
-Progress message updates at **1.5 s intervals** (fastest safe rate without hitting Telegram rate limits). Includes a live **[Cancel]** button:
-
-```
-🔎  [ULP]  netflix.com
-―――――――――――――
-🟡  Phase 1 — Scanning
-  [█████░░░░░]  50%
-  Hits    : 642,150
-  Unique  : 481,200
-  Elapsed : 14.3s
-
-[ ⏹ Cancel ]
-```
-
-### Done
-
-```
-✅  Done — netflix.com
-―――――――――――――
-  Hits    : 1,284,301
-  ULP     : 948,200
-  Combos  : 621,440
-  Time    : 38.7s
-  File    : 87.4 MB
-
-[ 🔍 Search Again ]  [ 🏠 Home ]
-```
-
----
-
-## Slash Commands (still work)
-
-| Command | Description |
-|---|---|
-| `/start` | Open main menu |
-| `/s <term>` | Jump directly to mode selector for a term |
-| `/c <term>` | Run COMBO search directly |
-| `/cancel` | Cancel the currently running search |
-| `/queue` | Show queue screen |
-| `/status` | Show status screen |
-| `/ram` | Show RAM screen |
-| `/clean` | Delete all saved result files |
+A private Telegram bot for high-speed credential log searching and extraction. Navigate entirely through inline buttons — no slash-command memorization needed.
 
 ---
 
 ## Features
 
-### GUI & Navigation
-
-- **Fully inline-keyboard driven** — buttons for all actions, no typing needed
-- **BotFather-style navigation** — nav messages edit in-place or auto-delete when you move on; the chat stays clean
-- **Mode selector** — ULP vs COMBO chosen via buttons, not slash commands
-- **Live [Cancel] button** on every progress message
-- **[Search Again] + [Home]** buttons on completion
-- **[Refresh] + [Back]** on Status, RAM, Queue screens
-- **[Clean All]** on Results screen
-- User-typed search term auto-deleted to keep chat clean
-
-### Update Speed
-
-- Progress messages update every **1.5 s** — fastest safe interval (Telegram allows ~30 edits/min per message; 1.5 s = 40/min, staying just under with retry tolerance)
-- `getUpdates` polling every **0.3 s** — near-instant button response
-- `answerCallbackQuery` called immediately on every button press — spinner disappears instantly
-
-### Search Engine (falcon_parse.py)
-
-- `ripgrep` with `--mmap` + `--no-unicode` + `-j <cpus>` for maximum throughput
-- mmap-based pure-Python fallback when ripgrep is unavailable
-- 4 MB write buffer, GNU sort with `--buffer-size=512M --parallel=<cpus>`
-- Balanced phase-2 chunk size (10k–50k per worker)
-
-### Bot Reliability
-
-- Persistent `requests.Session` with connection pooling (`pool_maxsize=10`)
-- Auto-retry on Telegram 5xx (3 attempts, backoff×0.4)
-- Exponential backoff on polling errors (2s → 60s)
-- `collections.deque` job queue (O(1) ops)
-- Full traceback logging in `queue_worker`
-- `UPDATE_LOCK` protecting `LAST_UPDATE_ID`
-- df result cached for 8 s
+- **Button-driven UI** — full navigation via inline keyboards; `/start` is all you need
+- **Fast credential search** — ripgrep (`rg`) with mmap + no-unicode mode for maximum throughput; pure-Python mmap fallback when `rg` is absent
+- **Dual output modes** — ULP (full matched lines) or COMBO (clean `user:pass` pairs)
+- **Job queue** — multiple searches queue automatically; live queue view with cancel support
+- **Dynamic progress bar** — hybrid hits-driven (phase 1) + time-driven (phase 2) bar with adaptive update rate (0.4 s fast-start → 1.0 s steady); visible movement from the first second
+- **Paginated archives** — browse, download, or wipe result files directly from the bot
+- **Auto file splitting** — files over 45 MB are split into parts and uploaded sequentially
+- **RAM & disk monitor** — live `/proc/meminfo` + `df` with 8 s cache
+- **Junk filtering** — promo lines, mojibake, null values, URL-only lines stripped before dedup
+- **GNU sort dedup** — 512 MB buffer + parallel sort handles arbitrarily large datasets
+- **Parallel combo extraction** — multi-core `ProcessPoolExecutor` with balanced chunk sizes
+- **Versioned backups** — each stable release is preserved as a `backup/vX.Y.Z-YYYY-MM-DD` branch before updates
+- **Resilient HTTP session** — 3-retry adapter with backoff on 429/5xx; adaptive polling backoff on network errors
 
 ---
 
-## How Falcon Works
-
-Two-phase pipeline:
-
-**Phase 1 — Search**
-- Uses `ripgrep` if installed (preferred) with `--mmap`, `--no-unicode`, and `-j <cpus>`
-- Falls back to mmap-based `ProcessPoolExecutor` pure-Python grep
-- Streams hits to disk — no RAM accumulation
-- Deduplicates via `sort -u --buffer-size=512M --parallel=<cpus>`
-- Output: `ULP_{term}.txt`
-
-**Phase 2 — Combo extraction**
-- Extracts clean `user:pass` pairs with multi-core `ProcessPoolExecutor`
-- Deduplicates via `sort -u`
-- Output: `COMBO_LP_{term}.txt`
-
-> Every search **overwrites** any previous result for the same term.
-
----
-
-## Queue Behavior
-
-- Only **one search runs at a time**
-- Additional searches are **queued in order**
-- `/cancel` kills only the **running** job — queued jobs continue
-- Queue screen shows running job + full pending list with a **[Cancel Job]** button
-
----
-
-## Large File Handling
-
-- Files **≤ 45 MB** → sent directly
-- Files **> 45 MB** → auto-split into 45 MB chunks via `shutil.copyfileobj`
-- If any part fails, you’re told exactly which part + file path on server
-
----
-
-## First-time Deploy
+## Quick Start
 
 ```bash
-git clone https://github.com/ayoubharraby/falcon-tg.git
+git clone https://github.com/ayoubharraby/falcon-tg
 cd falcon-tg
-bash setup.sh
+cp env.example .env          # fill in your tokens
+bash setup.sh                # installs deps + registers systemd service
 ```
+
+See **SERVER_DEPLOY.md** for full VPS deployment instructions.
 
 ---
 
-## Updating
+## Bot Navigation
 
-```bash
-bash ~/falcon-tg/update.sh
-```
+| Button | Action |
+|---|---|
+| 🔍 Search | Enter a term → choose ULP or COMBO mode |
+| 📋 Queue | View running + pending jobs; cancel current |
+| 🖥️ Status | Disk usage, archive count, running job |
+| 💾 RAM | Live RAM + swap breakdown |
+| 📦 Archives | Paginated file list — tap to download |
+
+### Slash commands (power users)
+
+| Command | Description |
+|---|---|
+| `/s <term>` | Open mode selector for term |
+| `/c <term>` | Enqueue COMBO search directly |
+| `/cancel` | Cancel current job |
+| `/queue` | Show queue screen |
+| `/status` | Show status screen |
+| `/ram` | Show RAM screen |
+| `/archives` | Show archives screen |
+| `/clean` | Delete all archive files |
 
 ---
 
 ## Configuration (`.env`)
 
 ```env
-TELEGRAM_BOT_TOKEN=your-token-here
-ALLOWED_CHAT_IDS=your-telegram-user-id
+TELEGRAM_BOT_TOKEN=your_token_here
+ALLOWED_CHAT_IDS=123456789,987654321
 SOURCE_DIR=/data/textset
 OUT_DIR=/data/archives
 PYTHON_BIN=python3
 ```
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | ✅ | — | From [@BotFather](https://t.me/BotFather) |
-| `ALLOWED_CHAT_IDS` | ✅ | — | Comma-separated Telegram user IDs |
-| `SOURCE_DIR` | — | `/data/textset` | Dataset directory or file |
-| `OUT_DIR` | — | `/data/archives` | Result file output directory |
-| `PYTHON_BIN` | — | `python3` | Python binary path |
+---
+
+## Progress Bar — How It Works
+
+The bar uses a **hybrid model** for smooth, data-driven feedback:
+
+- **Phase 1 (Scanning):** 70 % weight on real hit count vs. estimated total hits (derived from rolling hit-rate), 30 % weight on elapsed time. Gives genuine movement as hits accumulate.
+- **Phase 2 (Extracting):** Pure time-based against a 120 s calibration constant.
+- **Adaptive update rate:** 0.4 s for the first 30 s (immediate feedback), then 1.0 s steady-state (safely under Telegram's 20 edits/10 s burst limit).
+- Bar is capped at 99 % until `DONE` is received, then snaps to 100 %.
 
 ---
 
-## Service Management
+## Versioning & Backups
 
+Every stable version is backed up as a branch before any major update:
+
+```
+backup/v3.1.1-2026-07-11   ← current stable snapshot
+main                        ← latest (v3.2.0)
+```
+
+To restore a backup:
 ```bash
-sudo journalctl -u tg-private-bot -f
-sudo systemctl restart tg-private-bot
-sudo systemctl stop tg-private-bot
-sudo systemctl status tg-private-bot
+git fetch origin
+git checkout backup/v3.1.1-2026-07-11
 ```
 
 ---
 
-## Requirements
+## File Structure
 
-- Ubuntu / Debian Linux
-- Python 3.8+
-- `ripgrep` (strongly recommended: `sudo apt install ripgrep`)
-- GNU `sort`
-- `requests>=2.31.0`
-- `urllib3>=1.26.0`
+```
+falcon-tg/
+├── bot.py              # Telegram bot + job runner
+├── falcon_parse.py     # Search engine (ripgrep / mmap fallback)
+├── setup.sh            # Automated install + systemd setup
+├── update.sh           # Pull + restart helper
+├── tg-private-bot.service  # systemd unit file
+├── env.example         # Config template
+├── requirements.txt    # Python deps
+└── SERVER_DEPLOY.md    # VPS deployment guide
+```
+
+---
+
+## Version History
+
+| Version | Date | Notes |
+|---|---|---|
+| v3.2.0 | 2026-07-11 | Dynamic hybrid progress bar; adaptive edit interval; full audit |
+| v3.1.1 | 2026-07-11 | RAM fixes, sort-u dedup, /status, /clean; technical done msg |
+| v3.0.0 | — | ripgrep mmap integration, job queue, archives pagination |
+| v4.0.0 | — | falcon_parse: parallel combo extraction, GNU sort dedup |

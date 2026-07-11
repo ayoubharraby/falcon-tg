@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Falcon Telegram Bot v3.1.1
+Falcon Telegram Bot v3.2.0
 
 Navigate with buttons. No slash-command typing needed.
 
@@ -12,12 +12,12 @@ Flow:
   → 📥 Archives  →  paginated file list  →  tap file  →  sends it
   → 📋 Queue     →  [Cancel Job] [Refresh] [Back]
 
-Progress bar: time-based on observed 731 s full-run constant.
-Update interval: 1.0 s (safe under Telegram burst limit).
+Progress bar: hybrid hits-based + time-based for smooth real-time flow.
+Update interval: adaptive 0.4 s – 1.5 s, within Telegram burst limits.
 
 Config: copy env.example → .env
 """
-__version__ = "3.1.1"
+__version__ = "3.2.0"
 
 import os, re, time, queue, traceback, subprocess, threading, collections, json, shutil
 from pathlib import Path
@@ -60,19 +60,26 @@ API          = f"https://api.telegram.org/bot{TOKEN}"
 TG_MAX_BYTES = 45 * 1024 * 1024
 
 # ────────────────────────────────────────────────────────────
-# PROGRESS BAR CALIBRATION
+# PROGRESS BAR — HYBRID MODE
 #
-# Observed full-run time: 731 seconds → that is the 100% mark.
-# The bar is time-based (elapsed / 731) so it never stays at 0%.
-# We cap it at 99% until DONE is received, then snap to 100%.
+# Phase 1: uses reported hits to drive the bar when hit-rate is
+#           available, giving real data-driven movement.
+#           Falls back to elapsed-time when no hits yet.
+# Phase 2: uses elapsed time vs. a phase-2 constant (120 s typical).
+#
+# Bar is capped at 99 % until DONE is received, then snaps to 100 %.
+# Width=14 gives finer granularity — visible movement every ~7 seconds.
 # ────────────────────────────────────────────────────────────
-FULL_RUN_SECONDS = 731.0
+FULL_RUN_SECONDS  = 731.0   # phase-1 calibration (observed full run)
+PHASE2_SECONDS    = 120.0   # phase-2 calibration (sort + combo extraction)
 
-# Fastest safe edit interval.
-# Telegram burst tolerance ≈ 20 edits / 10 s per message.
-# At 1.0 s we send 10 edits / 10 s — well under burst.
-# The 3-retry session handles any occasional 429 automatically.
-EDIT_INTERVAL = 1.0
+# Adaptive edit interval.
+# We start fast (0.4 s) for the first 30 s so the user sees
+# immediate movement, then ease back to 1.0 s to stay safely
+# under Telegram's 20-edits/10 s burst limit.
+EDIT_INTERVAL_FAST = 0.4    # first 30 s of a job
+EDIT_INTERVAL_NORM = 1.0    # afterwards
+EDIT_FAST_WINDOW   = 30.0   # seconds to stay in fast mode
 
 # Archives pagination: files per page
 ARCHIVES_PAGE_SIZE = 8
@@ -232,26 +239,38 @@ def _list_archive_files():
     )
 
 # ════════════════════════════════════════════════════════════
-# PROGRESS BAR  (time-based, accurate from second 1)
+# PROGRESS BAR  (hybrid: hits-driven phase 1, time-driven phase 2)
 # ════════════════════════════════════════════════════════════
-def _progress_bar(elapsed_s, width=12, done=False):
+def _progress_bar(elapsed_s, width=14, done=False, phase=1,
+                  hits=0, expected_hits=0, phase2_elapsed=0.0):
     """
-    Draw a progress bar based on elapsed seconds vs. FULL_RUN_SECONDS.
+    Hybrid progress bar:
 
-    - Capped at 99% until `done=True` to avoid premature 100%.
-    - Width=12 gives enough resolution to see movement early on.
+    Phase 1:
+      If expected_hits > 0 and hits > 0, blend hits-based fraction (70 %
+      weight) with time-based fraction (30 % weight) so early movement is
+      real, not just a clock tick.  When no hit estimate is available,
+      falls back to pure time-based.
 
-    Math:
-        frac = elapsed / 731
-        At elapsed=0   → 0%
-        At elapsed=73  → 10%
-        At elapsed=365 → 50%
-        At elapsed=731 → 100% (only shown when done=True)
+    Phase 2:
+      Pure time-based against PHASE2_SECONDS constant.
+
+    Capped at 99 % until done=True → snaps to 100 %.
+    Width=14 → movement visible every ~5 s at normal run speed.
     """
     if done:
         frac = 1.0
+    elif phase == 2:
+        frac = min(phase2_elapsed / PHASE2_SECONDS, 0.99)
     else:
-        frac = min(elapsed_s / FULL_RUN_SECONDS, 0.99)
+        time_frac = min(elapsed_s / FULL_RUN_SECONDS, 0.99)
+        if expected_hits > 0 and hits > 0:
+            hit_frac = min(hits / expected_hits, 0.99)
+            frac = 0.70 * hit_frac + 0.30 * time_frac
+        else:
+            frac = time_frac
+        frac = min(frac, 0.99)
+
     filled = int(frac * width)
     bar    = "█" * filled + "░" * (width - filled)
     pct    = int(frac * 100)
@@ -663,11 +682,18 @@ def run_falcon(chat_id, term, mode):
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         bufsize=1, text=True, errors="ignore")
 
-    last_text  = ""
-    last_edit  = 0.0
-    cancelled  = False
-    done_stats = None
-    job_start  = time.time()
+    last_text      = ""
+    last_edit      = 0.0
+    cancelled      = False
+    done_stats     = None
+    job_start      = time.time()
+    phase2_start   = None   # set when phase=2 is first seen
+    last_hits      = 0      # rolling hit count for blended bar
+    expected_hits  = 0      # estimated total hits (set after first batch)
+    # Hit-rate estimation: track hits/sec over a rolling window
+    _hit_samples   = []     # list of (timestamp, hits)
+    _HIT_WINDOW    = 30.0   # seconds of history to keep
+    _HIT_ETA_MULT  = 1.1    # slight over-estimate so bar never stays stuck
 
     try:
         for line in proc.stdout:
@@ -681,46 +707,79 @@ def run_falcon(chat_id, term, mode):
             m    = PROGRESS_RE.search(line)
             d    = DONE_RE.search(line)
 
+            # ── Adaptive edit interval ──────────────────────
+            wall_elapsed = now - job_start
+            edit_interval = (EDIT_INTERVAL_FAST
+                             if wall_elapsed < EDIT_FAST_WINDOW
+                             else EDIT_INTERVAL_NORM)
+
             if m:
-                phase            = m.group(1)
+                phase            = int(m.group(1))
                 reported_elapsed = float(m.group(5))
                 wall_elapsed     = now - job_start
-                elapsed_for_bar  = max(reported_elapsed, wall_elapsed)
-                bar              = _progress_bar(elapsed_for_bar)
 
-                if phase == "1":
-                    hits = m.group(2)
-                    ulp  = m.group(3)
+                if phase == 1:
+                    hits = int(m.group(2) or 0)
+                    ulp  = int(m.group(3) or 0)
+
+                    # Rolling hit-rate → expected_hits estimate
+                    _hit_samples.append((now, hits))
+                    _hit_samples = [(t, h) for t, h in _hit_samples
+                                    if now - t <= _HIT_WINDOW]
+                    if len(_hit_samples) >= 2 and reported_elapsed > 5:
+                        t0, h0 = _hit_samples[0]
+                        rate   = (hits - h0) / max(now - t0, 1.0)  # hits/s
+                        if rate > 0:
+                            remaining = FULL_RUN_SECONDS - reported_elapsed
+                            expected_hits = int((hits + rate * remaining) * _HIT_ETA_MULT)
+                    last_hits = hits
+
+                    bar = _progress_bar(
+                        elapsed_s=reported_elapsed,
+                        done=False, phase=1,
+                        hits=last_hits,
+                        expected_hits=expected_hits,
+                    )
                     text = (
                         f"🔎  [{label}]  {term}\n"
                         f"―――――――――――――\n"
                         f"🟡  Phase 1 — Scanning\n"
                         f"{bar}\n"
-                        f"  Hits    : {int(hits):,}\n"
-                        f"  Unique  : {int(ulp):,}\n"
+                        f"  Hits    : {hits:,}\n"
+                        f"  Unique  : {ulp:,}\n"
                         f"  Elapsed : {reported_elapsed:.1f}s"
                     )
-                else:
-                    combos = m.group(4)
+
+                else:  # phase 2
+                    if phase2_start is None:
+                        phase2_start = now
+                    combos = int(m.group(4) or 0)
+                    p2_elapsed = now - phase2_start
+
+                    bar = _progress_bar(
+                        elapsed_s=reported_elapsed,
+                        done=False, phase=2,
+                        phase2_elapsed=p2_elapsed,
+                    )
                     text = (
                         f"🔎  [{label}]  {term}\n"
                         f"―――――――――――――\n"
                         f"🟢  Phase 2 — Extracting\n"
                         f"{bar}\n"
-                        f"  Combos  : {int(combos):,}\n"
+                        f"  Combos  : {combos:,}\n"
                         f"  Elapsed : {reported_elapsed:.1f}s"
                     )
 
-                if now - last_edit >= EDIT_INTERVAL and text != last_text:
+                if now - last_edit >= edit_interval and text != last_text:
                     edit_message(chat_id, msg_id, text,
                                  reply_markup=_kb([("⏹ Cancel", "do:cancel")]))
                     last_edit = now
                     last_text = text
 
             elif d:
-                hits        = d.group(1)
-                ulp         = d.group(2)
-                combos      = d.group(3)
+                hits        = int(d.group(1))
+                ulp         = int(d.group(2))
+                combos      = int(d.group(3))
                 elapsed_s   = float(d.group(4))
                 ulp_bytes   = int(d.group(5) or 0)
                 combo_bytes = int(d.group(6) or 0)
@@ -731,9 +790,9 @@ def run_falcon(chat_id, term, mode):
                     f"📊  [{label}]  {term}\n"
                     f"―――――――――――――\n"
                     f"{bar}\n"
-                    f"  Hits    : {int(hits):,}\n"
-                    f"  ULP     : {int(ulp):,}\n"
-                    f"  Combos  : {int(combos):,}\n"
+                    f"  Hits    : {hits:,}\n"
+                    f"  ULP     : {ulp:,}\n"
+                    f"  Combos  : {combos:,}\n"
                     f"  Time    : {elapsed_s:.1f}s\n"
                     f"⬆️  Preparing upload...")
         proc.wait()
@@ -774,9 +833,9 @@ def run_falcon(chat_id, term, mode):
         lines = [
             f"✅  Done — {term}",
             f"―――――――――――――",
-            f"  Hits    : {int(hits):,}",
-            f"  ULP     : {int(ulp):,}",
-            f"  Combos  : {int(combos):,}",
+            f"  Hits    : {hits:,}",
+            f"  ULP     : {ulp:,}",
+            f"  Combos  : {combos:,}",
             f"  Time    : {elapsed_s:.1f}s",
         ]
         if mode == "ulp" and ulp_bytes:
@@ -997,7 +1056,7 @@ def main():
 
     threading.Thread(target=queue_worker, daemon=True).start()
     print(f"Falcon Bot v{__version__} started. (source={SOURCE_DIR}, out={OUT_DIR})")
-    print(f"Progress bar calibrated to {FULL_RUN_SECONDS}s full run.")
+    print(f"Progress bar: hybrid hits+time mode. Fast interval={EDIT_INTERVAL_FAST}s for first {EDIT_FAST_WINDOW}s, then {EDIT_INTERVAL_NORM}s.")
 
     backoff = 2.0
     while True:
