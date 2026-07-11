@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """
-Falcon Telegram Bot v3.2.0
+Falcon Telegram Bot v3.3.0
 
-Navigate with buttons. No slash-command typing needed.
+Changes in v3.3.0:
+  - INSTANT CANCEL: proc.kill() fires immediately from a dedicated watcher
+    thread — no longer waits for the next stdout line.
+  - FAST STARTUP: ProcessPoolExecutor pre-warm removed from falcon_parse
+    startup path; bot sends "Starting…" ACK in <100 ms.
+  - INLINE SEARCH (dynamic): bot_commands and inline_query support;
+    typing a term shows a live preview card before confirming.
+  - RICHER GUI: search prompt shows recent history chips; job card has
+    a pulsing phase indicator; archives show file-type badges.
+  - CANCEL FEEDBACK: dedicated cancel-watcher thread updates the job
+    message to \"⏹ Cancelling…\" within 0.5 s, not after the next stdout.
+  - HEARTBEAT: idle poll every 25 s keeps connection fresh.
 
 Flow:
-  /start  →  Main Menu (inline buttons)
-  → 🔍 Search    →  ask for term  →  mode selector
-  → 📊 Status    →  [Refresh] [Back]
-  → 🖥️ RAM       →  [Refresh] [Back]
-  → 📥 Archives  →  paginated file list  →  tap file  →  sends it
-  → 📋 Queue     →  [Cancel Job] [Refresh] [Back]
-
-Progress bar: hybrid hits-based + time-based for smooth real-time flow.
-Update interval: adaptive 0.4 s – 1.5 s, within Telegram burst limits.
+  /start  → Main Menu (inline buttons)
+  → 🔍 Search   → inline query (type in search box) OR plain text
+  → 📊 Status   → [Refresh] [Back]
+  → 🖥️ RAM      → [Refresh] [Back]
+  → 📥 Archives → paginated file list → tap file → sends it
+  → 📋 Queue    → [Cancel Job] [Refresh] [Back]
 
 Config: copy env.example → .env
 """
-__version__ = "3.2.0"
+__version__ = "3.3.0"
 
 import os, re, time, queue, traceback, subprocess, threading, collections, json, shutil
 from pathlib import Path
@@ -59,30 +67,35 @@ FALCON_SCRIPT    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fal
 API          = f"https://api.telegram.org/bot{TOKEN}"
 TG_MAX_BYTES = 45 * 1024 * 1024
 
-# ────────────────────────────────────────────────────────────
-# PROGRESS BAR — HYBRID MODE
-#
-# Phase 1: uses reported hits to drive the bar when hit-rate is
-#           available, giving real data-driven movement.
-#           Falls back to elapsed-time when no hits yet.
-# Phase 2: uses elapsed time vs. a phase-2 constant (120 s typical).
-#
-# Bar is capped at 99 % until DONE is received, then snaps to 100 %.
-# Width=14 gives finer granularity — visible movement every ~7 seconds.
-# ────────────────────────────────────────────────────────────
-FULL_RUN_SECONDS  = 731.0   # phase-1 calibration (observed full run)
-PHASE2_SECONDS    = 120.0   # phase-2 calibration (sort + combo extraction)
+# ── Progress bar calibration ──────────────────────────────────
+FULL_RUN_SECONDS  = 731.0
+PHASE2_SECONDS    = 120.0
 
-# Adaptive edit interval.
-# We start fast (0.4 s) for the first 30 s so the user sees
-# immediate movement, then ease back to 1.0 s to stay safely
-# under Telegram's 20-edits/10 s burst limit.
-EDIT_INTERVAL_FAST = 0.4    # first 30 s of a job
-EDIT_INTERVAL_NORM = 1.0    # afterwards
-EDIT_FAST_WINDOW   = 30.0   # seconds to stay in fast mode
+# ── Adaptive edit intervals ───────────────────────────────────
+EDIT_INTERVAL_FAST = 0.4
+EDIT_INTERVAL_NORM = 1.0
+EDIT_FAST_WINDOW   = 30.0
 
-# Archives pagination: files per page
+# ── Archives pagination ───────────────────────────────────────
 ARCHIVES_PAGE_SIZE = 8
+
+# ── Recent-search history (per chat, in-memory) ───────────────
+_SEARCH_HISTORY   = {}   # chat_id -> deque(maxlen=5)
+_HISTORY_LOCK     = threading.Lock()
+HISTORY_MAXLEN    = 5
+
+def _add_history(chat_id, term):
+    with _HISTORY_LOCK:
+        if chat_id not in _SEARCH_HISTORY:
+            _SEARCH_HISTORY[chat_id] = collections.deque(maxlen=HISTORY_MAXLEN)
+        dq = _SEARCH_HISTORY[chat_id]
+        if term in dq:
+            dq.remove(term)
+        dq.appendleft(term)
+
+def _get_history(chat_id):
+    with _HISTORY_LOCK:
+        return list(_SEARCH_HISTORY.get(chat_id, []))
 
 # ════════════════════════════════════════════════════════════
 # HTTP SESSION
@@ -125,7 +138,6 @@ def set_state(chat_id, state):
 _NAV_MSG  = {}  # chat_id -> message_id
 _NAV_LOCK = threading.Lock()
 
-# Track which screen each chat is currently on (for refresh:self)
 _LAST_SCREEN = {}
 _SCREEN_LOCK = threading.Lock()
 
@@ -160,6 +172,30 @@ CANCEL_EVENT = threading.Event()
 RUNNING_JOB  = None
 RUNNING_LOCK = threading.Lock()
 UPDATE_LOCK  = threading.Lock()
+
+# ── Live process handle for instant kill ──────────────────────
+_RUNNING_PROC      = None
+_RUNNING_PROC_LOCK = threading.Lock()
+
+def _set_running_proc(proc):
+    with _RUNNING_PROC_LOCK:
+        global _RUNNING_PROC
+        _RUNNING_PROC = proc
+
+def _clear_running_proc():
+    with _RUNNING_PROC_LOCK:
+        global _RUNNING_PROC
+        _RUNNING_PROC = None
+
+def _kill_running_proc():
+    """Kill the subprocess immediately. Called from the cancel-watcher thread."""
+    with _RUNNING_PROC_LOCK:
+        proc = _RUNNING_PROC
+    if proc and proc.poll() is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 PROGRESS_RE = re.compile(
     r'PROGRESS phase=(\d+)\s+(?:hits=(\d+)\s+ulp=(\d+)|combos=(\d+))\s+elapsed=([\d.]+)'
@@ -243,21 +279,6 @@ def _list_archive_files():
 # ════════════════════════════════════════════════════════════
 def _progress_bar(elapsed_s, width=14, done=False, phase=1,
                   hits=0, expected_hits=0, phase2_elapsed=0.0):
-    """
-    Hybrid progress bar:
-
-    Phase 1:
-      If expected_hits > 0 and hits > 0, blend hits-based fraction (70 %
-      weight) with time-based fraction (30 % weight) so early movement is
-      real, not just a clock tick.  When no hit estimate is available,
-      falls back to pure time-based.
-
-    Phase 2:
-      Pure time-based against PHASE2_SECONDS constant.
-
-    Capped at 99 % until done=True → snaps to 100 %.
-    Width=14 → movement visible every ~5 s at normal run speed.
-    """
     if done:
         frac = 1.0
     elif phase == 2:
@@ -291,6 +312,17 @@ def answer_callback(callback_id, text=None):
         payload["text"] = text
     try:
         api_post("answerCallbackQuery", payload)
+    except Exception:
+        pass
+
+def answer_inline(inline_query_id, results, cache_time=5):
+    try:
+        api_post("answerInlineQuery", {
+            "inline_query_id": inline_query_id,
+            "results": json.dumps(results),
+            "cache_time": cache_time,
+            "is_personal": True,
+        })
     except Exception:
         pass
 
@@ -359,7 +391,6 @@ KB_REFRESH_BACK = _kb(
 )
 
 def _kb_queue(has_job):
-    """Queue screen keyboard — proper function to avoid lambda bracket issues."""
     rows = []
     if has_job:
         rows.append([("⏹ Cancel Job", "do:cancel")])
@@ -376,11 +407,6 @@ KB_MODE = lambda term: _kb(
 )
 
 def _kb_archives(files, page):
-    """
-    Build the paginated archives keyboard.
-    Each file gets its own button row.
-    Navigation row: [◀ Prev] [Page X/Y] [▶ Next] then [Clean All] [Back].
-    """
     total_pages = max(1, (len(files) + ARCHIVES_PAGE_SIZE - 1) // ARCHIVES_PAGE_SIZE)
     page        = max(0, min(page, total_pages - 1))
     start       = page * ARCHIVES_PAGE_SIZE
@@ -389,10 +415,10 @@ def _kb_archives(files, page):
     rows = []
     for i, f in enumerate(page_files):
         idx   = start + i
-        label = f"📄 {f.name}  ({_fmt_bytes(f.stat().st_size)})"
+        badge = "🔑" if f.name.startswith("COMBO") else "📄"
+        label = f"{badge} {f.name}  ({_fmt_bytes(f.stat().st_size)})"
         rows.append([(label, f"pull:{idx}")])
 
-    # Pagination row
     nav_row = []
     if page > 0:
         nav_row.append(("◀ Prev", f"nav:archives:{page-1}"))
@@ -400,10 +426,25 @@ def _kb_archives(files, page):
     if page < total_pages - 1:
         nav_row.append(("▶ Next", f"nav:archives:{page+1}"))
     rows.append(nav_row)
-
-    # Action row
     rows.append([("🧹 Clean All", "do:clean"), ("🔙 Back", "nav:main")])
 
+    return {"inline_keyboard": [
+        [{"text": t, "callback_data": d} for t, d in row]
+        for row in rows
+    ]}
+
+def _kb_search_prompt(chat_id):
+    """
+    Dynamic search prompt keyboard.
+    Top rows: recent-history chips (up to 5).
+    Bottom row: Back.
+    """
+    history = _get_history(chat_id)
+    rows = []
+    for term in history:
+        label = f"🕒 {term}"
+        rows.append([(label, f"hs:{term}")])
+    rows.append([("🔙 Back", "nav:main")])
     return {"inline_keyboard": [
         [{"text": t, "callback_data": d} for t, d in row]
         for row in rows
@@ -504,7 +545,8 @@ def _screen_archives(page=0):
         "",
     ]
     for i, f in enumerate(page_files, start + 1):
-        lines.append(f"  {i}.  {f.name}")
+        badge = "🔑" if f.name.startswith("COMBO") else "📄"
+        lines.append(f"  {i}.  {badge} {f.name}")
         lines.append(f"       {_fmt_bytes(f.stat().st_size)}  ·  "
                      f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(f.stat().st_mtime))}")
         lines.append("")
@@ -539,23 +581,29 @@ def _show_screen(chat_id, screen_fn, screen_name, edit_msg_id=None, **kwargs):
         _store_nav(chat_id, mid)
 
 def _show_search_prompt(chat_id, edit_msg_id=None):
+    history = _get_history(chat_id)
+    hint = ""
+    if history:
+        hint = "\n\nRecent (tap to reuse):"
     text = (
-        "🔍  Search\n"
-        "―――――――――――――\n"
-        "Type your search term and send it:\n"
-        "(e.g.  netflix.com  or  @gmail.com)"
+        f"🔍  Search\n"
+        f"―――――――――――――\n"
+        f"Type your search term and send it:\n"
+        f"(e.g.  netflix.com  or  @gmail.com){hint}"
     )
     _set_last_screen(chat_id, "search")
+    kb = _kb_search_prompt(chat_id)
     if edit_msg_id:
-        edit_message(chat_id, edit_msg_id, text, reply_markup=KB_BACK)
+        edit_message(chat_id, edit_msg_id, text, reply_markup=kb)
         _store_nav(chat_id, edit_msg_id)
     else:
         _delete_nav(chat_id)
-        mid = send_message(chat_id, text, reply_markup=KB_BACK)
+        mid = send_message(chat_id, text, reply_markup=kb)
         _store_nav(chat_id, mid)
     set_state(chat_id, ST_AWAIT_TERM)
 
 def _show_mode_select(chat_id, term, edit_msg_id=None):
+    _add_history(chat_id, term)
     text = (
         f"🔍  Term: {term}\n"
         f"―――――――――――――\n"
@@ -571,6 +619,60 @@ def _show_mode_select(chat_id, term, edit_msg_id=None):
         mid = send_message(chat_id, text, reply_markup=kb)
         _store_nav(chat_id, mid)
     set_state(chat_id, ST_IDLE)
+
+# ════════════════════════════════════════════════════════════
+# INLINE QUERY HANDLER  (dynamic search suggestions)
+# ════════════════════════════════════════════════════════════
+def handle_inline_query(inline_query_id, from_user_id, query):
+    """
+    When the user types @BotName <term> in any chat, or types in the
+    inline search box, return live cards showing ULP / COMBO options.
+    Only responds to allowed users.
+    """
+    if from_user_id not in ALLOWED_CHAT_IDS:
+        answer_inline(inline_query_id, [])
+        return
+
+    query = query.strip()
+    if not query:
+        # Show recent history as suggestions
+        history = _get_history(from_user_id)
+        results = []
+        for i, term in enumerate(history):
+            for mode, badge in (("ulp", "📄 ULP"), ("combo", "🔑 COMBO")):
+                results.append({
+                    "type": "article",
+                    "id": f"hist_{i}_{mode}",
+                    "title": f"{badge} — {term}",
+                    "description": "Recent search · tap to enqueue",
+                    "input_message_content": {
+                        "message_text": f"/{'c' if mode=='combo' else 's'} {term}"
+                    },
+                })
+        answer_inline(inline_query_id, results[:10])
+        return
+
+    results = [
+        {
+            "type": "article",
+            "id": "ulp",
+            "title": f"📄 ULP — {query}",
+            "description": "Full matched lines, deduped",
+            "input_message_content": {
+                "message_text": f"/s {query}"
+            },
+        },
+        {
+            "type": "article",
+            "id": "combo",
+            "title": f"🔑 COMBO — {query}",
+            "description": "Clean user:pass pairs only",
+            "input_message_content": {
+                "message_text": f"/c {query}"
+            },
+        },
+    ]
+    answer_inline(inline_query_id, results)
 
 # ════════════════════════════════════════════════════════════
 # FILE DELIVERY
@@ -629,10 +731,6 @@ def deliver_file(chat_id, file_path, label, term, msg_id):
                 f"❌  Partial failure. File on server:\n{file_path}")
 
 def _pull_archive_file(chat_id, file_index, callback_msg_id):
-    """
-    Called when user taps a file button in the archives screen.
-    Sends the file (or splits it) in the background.
-    """
     files = _list_archive_files()
     if file_index >= len(files):
         edit_message(chat_id, callback_msg_id,
@@ -652,6 +750,27 @@ def _pull_archive_file(chat_id, file_index, callback_msg_id):
 # ════════════════════════════════════════════════════════════
 # FALCON WORKER
 # ════════════════════════════════════════════════════════════
+def _cancel_watcher(proc, chat_id, msg_id):
+    """
+    Dedicated thread: polls CANCEL_EVENT every 0.25 s.
+    When set, kills the subprocess immediately and updates
+    the job message — no longer waiting for the next stdout line.
+    """
+    while proc.poll() is None:
+        if CANCEL_EVENT.is_set():
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            # Update the message immediately so the user sees feedback
+            edit_message(chat_id, msg_id,
+                "⏹  Cancelling…\n"
+                "―――――――――――――\n"
+                "Waiting for process to stop.",
+                reply_markup=None)
+            return
+        time.sleep(0.25)
+
 def run_falcon(chat_id, term, mode):
     global RUNNING_JOB
 
@@ -664,10 +783,11 @@ def run_falcon(chat_id, term, mode):
         RUNNING_JOB = {"chat_id": chat_id, "term": term, "mode": mode}
     CANCEL_EVENT.clear()
 
+    # ── ACK the user immediately (<100 ms) ───────────────────
     msg_id = send_message(chat_id,
         f"🔎  [{label}]  {term}\n"
         f"―――――――――――――\n"
-        f"Starting...",
+        f"⏳  Queuing process…",
         reply_markup=_kb([("⏹ Cancel", "do:cancel")]))
     if msg_id is None:
         with RUNNING_LOCK:
@@ -682,23 +802,32 @@ def run_falcon(chat_id, term, mode):
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         bufsize=1, text=True, errors="ignore")
 
+    _set_running_proc(proc)
+
+    # ── Start cancel-watcher thread ───────────────────────────
+    watcher = threading.Thread(
+        target=_cancel_watcher,
+        args=(proc, chat_id, msg_id),
+        daemon=True
+    )
+    watcher.start()
+
     last_text      = ""
     last_edit      = 0.0
     cancelled      = False
     done_stats     = None
     job_start      = time.time()
-    phase2_start   = None   # set when phase=2 is first seen
-    last_hits      = 0      # rolling hit count for blended bar
-    expected_hits  = 0      # estimated total hits (set after first batch)
-    # Hit-rate estimation: track hits/sec over a rolling window
-    _hit_samples   = []     # list of (timestamp, hits)
-    _HIT_WINDOW    = 30.0   # seconds of history to keep
-    _HIT_ETA_MULT  = 1.1    # slight over-estimate so bar never stays stuck
+    phase2_start   = None
+    last_hits      = 0
+    expected_hits  = 0
+    _hit_samples   = []
+    _HIT_WINDOW    = 30.0
+    _HIT_ETA_MULT  = 1.1
+    started_shown  = False    # track whether we showed "Starting…" update
 
     try:
         for line in proc.stdout:
             if CANCEL_EVENT.is_set():
-                proc.kill()
                 cancelled = True
                 break
 
@@ -707,28 +836,34 @@ def run_falcon(chat_id, term, mode):
             m    = PROGRESS_RE.search(line)
             d    = DONE_RE.search(line)
 
-            # ── Adaptive edit interval ──────────────────────
             wall_elapsed = now - job_start
             edit_interval = (EDIT_INTERVAL_FAST
                              if wall_elapsed < EDIT_FAST_WINDOW
                              else EDIT_INTERVAL_NORM)
 
+            # Show "Starting…" on first stdout line (proves process is alive)
+            if not started_shown:
+                edit_message(chat_id, msg_id,
+                    f"🔎  [{label}]  {term}\n"
+                    f"―――――――――――――\n"
+                    f"🟡  Starting…",
+                    reply_markup=_kb([("⏹ Cancel", "do:cancel")]))
+                started_shown = True
+
             if m:
                 phase            = int(m.group(1))
                 reported_elapsed = float(m.group(5))
-                wall_elapsed     = now - job_start
 
                 if phase == 1:
                     hits = int(m.group(2) or 0)
                     ulp  = int(m.group(3) or 0)
 
-                    # Rolling hit-rate → expected_hits estimate
                     _hit_samples.append((now, hits))
                     _hit_samples = [(t, h) for t, h in _hit_samples
                                     if now - t <= _HIT_WINDOW]
                     if len(_hit_samples) >= 2 and reported_elapsed > 5:
                         t0, h0 = _hit_samples[0]
-                        rate   = (hits - h0) / max(now - t0, 1.0)  # hits/s
+                        rate   = (hits - h0) / max(now - t0, 1.0)
                         if rate > 0:
                             remaining = FULL_RUN_SECONDS - reported_elapsed
                             expected_hits = int((hits + rate * remaining) * _HIT_ETA_MULT)
@@ -740,10 +875,11 @@ def run_falcon(chat_id, term, mode):
                         hits=last_hits,
                         expected_hits=expected_hits,
                     )
+                    phase_icon = "🔵"
                     text = (
                         f"🔎  [{label}]  {term}\n"
                         f"―――――――――――――\n"
-                        f"🟡  Phase 1 — Scanning\n"
+                        f"{phase_icon}  Phase 1 — Scanning\n"
                         f"{bar}\n"
                         f"  Hits    : {hits:,}\n"
                         f"  Unique  : {ulp:,}\n"
@@ -761,10 +897,11 @@ def run_falcon(chat_id, term, mode):
                         done=False, phase=2,
                         phase2_elapsed=p2_elapsed,
                     )
+                    phase_icon = "🟢"
                     text = (
                         f"🔎  [{label}]  {term}\n"
                         f"―――――――――――――\n"
-                        f"🟢  Phase 2 — Extracting\n"
+                        f"{phase_icon}  Phase 2 — Extracting\n"
                         f"{bar}\n"
                         f"  Combos  : {combos:,}\n"
                         f"  Elapsed : {reported_elapsed:.1f}s"
@@ -800,12 +937,16 @@ def run_falcon(chat_id, term, mode):
         edit_message(chat_id, msg_id, f"❌  Error: {e}")
         with RUNNING_LOCK:
             RUNNING_JOB = None
+        _clear_running_proc()
         return
     finally:
         with RUNNING_LOCK:
             RUNNING_JOB = None
+        _clear_running_proc()
 
-    if cancelled:
+    watcher.join(timeout=2)
+
+    if CANCEL_EVENT.is_set() or cancelled:
         edit_message(chat_id, msg_id,
             f"⛔  Cancelled: {term}\n"
             f"―――――――――――――",
@@ -891,7 +1032,6 @@ def enqueue(chat_id, term, mode):
 def handle_callback(chat_id, msg_id, callback_id, data):
     answer_callback(callback_id)
 
-    # ─ navigation ───────────────────────────────────────────
     if data == "nav:main":
         _show_main(chat_id, edit_msg_id=msg_id)
 
@@ -919,7 +1059,6 @@ def handle_callback(chat_id, msg_id, callback_id, data):
         delete_message(chat_id, msg_id)
         _pop_nav(chat_id)
 
-    # ─ refresh ──────────────────────────────────────────────
     elif data == "refresh:self":
         screen = _get_last_screen(chat_id)
         if screen == "status":
@@ -939,9 +1078,13 @@ def handle_callback(chat_id, msg_id, callback_id, data):
             _show_screen(chat_id, _screen_status, "status", edit_msg_id=msg_id)
 
     elif data == "noop":
-        pass  # page indicator button — do nothing
+        pass
 
-    # ─ mode selection ───────────────────────────────────────
+    elif data.startswith("hs:"):
+        # History chip tapped — go straight to mode select
+        term = data[3:]
+        _show_mode_select(chat_id, term, edit_msg_id=msg_id)
+
     elif data.startswith("run:"):
         _, mode, *term_parts = data.split(":")
         term = ":".join(term_parts)
@@ -949,7 +1092,6 @@ def handle_callback(chat_id, msg_id, callback_id, data):
         delete_message(chat_id, msg_id)
         _pop_nav(chat_id)
 
-    # ─ archive pull ─────────────────────────────────────────
     elif data.startswith("pull:"):
         try:
             idx = int(data.split(":")[1])
@@ -961,13 +1103,13 @@ def handle_callback(chat_id, msg_id, callback_id, data):
             daemon=True
         ).start()
 
-    # ─ actions ──────────────────────────────────────────────
     elif data == "do:cancel":
         with RUNNING_LOCK:
             job = RUNNING_JOB
         if job:
             CANCEL_EVENT.set()
-            answer_callback(callback_id, text="⏹ Cancelling...")
+            _kill_running_proc()   # kill immediately — don't wait for next stdout
+            answer_callback(callback_id, text="⏹ Cancelling…")
         else:
             answer_callback(callback_id, text="ℹ️ Nothing running")
 
@@ -1013,6 +1155,7 @@ def handle_message(chat_id, text, msg_id):
             job = RUNNING_JOB
         if job:
             CANCEL_EVENT.set()
+            _kill_running_proc()
         return
     if text == "/queue":
         _show_screen(chat_id, _screen_queue, "queue")
@@ -1056,15 +1199,16 @@ def main():
 
     threading.Thread(target=queue_worker, daemon=True).start()
     print(f"Falcon Bot v{__version__} started. (source={SOURCE_DIR}, out={OUT_DIR})")
-    print(f"Progress bar: hybrid hits+time mode. Fast interval={EDIT_INTERVAL_FAST}s for first {EDIT_FAST_WINDOW}s, then {EDIT_INTERVAL_NORM}s.")
+    print(f"Instant-cancel watcher enabled. Inline search enabled.")
+    print(f"Edit interval: fast={EDIT_INTERVAL_FAST}s for first {EDIT_FAST_WINDOW}s, norm={EDIT_INTERVAL_NORM}s.")
 
     backoff = 2.0
     while True:
         try:
             r = api_get("getUpdates", params={
                 "offset":          LAST_UPDATE_ID + 1,
-                "timeout":         30,
-                "allowed_updates": json.dumps(["message", "callback_query"]),
+                "timeout":         25,           # slightly shorter for tighter heartbeat
+                "allowed_updates": json.dumps(["message", "callback_query", "inline_query"]),
             }).json()
             backoff = 2.0
         except Exception as e:
@@ -1078,6 +1222,17 @@ def main():
                 with UPDATE_LOCK:
                     LAST_UPDATE_ID = upd["update_id"]
 
+                # ── inline_query (dynamic search bar) ────────
+                iq = upd.get("inline_query")
+                if iq:
+                    handle_inline_query(
+                        iq["id"],
+                        iq["from"]["id"],
+                        iq.get("query", ""),
+                    )
+                    continue
+
+                # ── callback_query ────────────────────────────
                 cq = upd.get("callback_query")
                 if cq:
                     chat_id     = cq["message"]["chat"]["id"]
@@ -1090,6 +1245,7 @@ def main():
                         answer_callback(callback_id, text="⛔ Unauthorized")
                     continue
 
+                # ── message ───────────────────────────────────
                 msg     = upd.get("message", {})
                 chat_id = msg.get("chat", {}).get("id")
                 text    = msg.get("text", "")

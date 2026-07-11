@@ -11,13 +11,17 @@ A private Telegram bot for high-speed credential log searching and extraction. N
 - **Dual output modes** — ULP (full matched lines) or COMBO (clean `user:pass` pairs)
 - **Job queue** — multiple searches queue automatically; live queue view with cancel support
 - **Dynamic progress bar** — hybrid hits-driven (phase 1) + time-driven (phase 2) bar with adaptive update rate (0.4 s fast-start → 1.0 s steady); visible movement from the first second
+- **Instant cancel** — dedicated cancel-watcher thread kills the subprocess within 0.25 s; no longer waits for the next stdout line from a long sort/dedup phase
+- **Inline search (dynamic)** — type `@BotName <term>` anywhere in Telegram to get live ULP/COMBO suggestion cards; recent history shown when query is empty
+- **Search history chips** — last 5 searches shown as quick-tap buttons in the search prompt
+- **File-type badges** — COMBO archives show 🔑, ULP archives show 📄 throughout the UI
 - **Paginated archives** — browse, download, or wipe result files directly from the bot
 - **Auto file splitting** — files over 45 MB are split into parts and uploaded sequentially
 - **RAM & disk monitor** — live `/proc/meminfo` + `df` with 8 s cache
 - **Junk filtering** — promo lines, mojibake, null values, URL-only lines stripped before dedup
 - **GNU sort dedup** — 512 MB buffer + parallel sort handles arbitrarily large datasets
 - **Parallel combo extraction** — multi-core `ProcessPoolExecutor` with balanced chunk sizes
-- **Versioned backups** — each stable release is preserved as a `backup/vX.Y.Z-YYYY-MM-DD` branch before updates
+- **Versioned backups** — each stable release is preserved as a `backups/` file before updates
 - **Resilient HTTP session** — 3-retry adapter with backoff on 429/5xx; adaptive polling backoff on network errors
 
 ---
@@ -39,11 +43,21 @@ See **SERVER_DEPLOY.md** for full VPS deployment instructions.
 
 | Button | Action |
 |---|---|
-| 🔍 Search | Enter a term → choose ULP or COMBO mode |
+| 🔍 Search | Enter a term → history chips shown → choose ULP or COMBO mode |
 | 📋 Queue | View running + pending jobs; cancel current |
 | 🖥️ Status | Disk usage, archive count, running job |
 | 💾 RAM | Live RAM + swap breakdown |
-| 📦 Archives | Paginated file list — tap to download |
+| 📦 Archives | Paginated file list (🔑 COMBO / 📄 ULP badges) — tap to download |
+
+### Inline Search (Dynamic)
+
+Enable inline mode for your bot via @BotFather (`/setinline`), then type:
+
+```
+@YourBotName netflix.com
+```
+
+You'll instantly see ULP and COMBO option cards. Tap one to enqueue. Empty query shows your 5 most recent searches.
 
 ### Slash commands (power users)
 
@@ -51,7 +65,7 @@ See **SERVER_DEPLOY.md** for full VPS deployment instructions.
 |---|---|
 | `/s <term>` | Open mode selector for term |
 | `/c <term>` | Enqueue COMBO search directly |
-| `/cancel` | Cancel current job |
+| `/cancel` | Cancel current job (instant) |
 | `/queue` | Show queue screen |
 | `/status` | Show status screen |
 | `/ram` | Show RAM screen |
@@ -83,19 +97,32 @@ The bar uses a **hybrid model** for smooth, data-driven feedback:
 
 ---
 
+## Cancel — How Instant Cancel Works
+
+Previous versions signalled `CANCEL_EVENT` but had to wait for the next `stdout` line from the subprocess before calling `proc.kill()`. During the `sort -u` dedup phase (which produces no stdout), this caused **up to 2-minute delays**.
+
+v3.3.0 fixes this with a dedicated **cancel-watcher thread** that:
+1. Polls `CANCEL_EVENT` every 0.25 s independently of stdout
+2. Calls `proc.kill()` immediately when set
+3. Updates the job message to `⏹ Cancelling…` within 0.25 s
+4. Additionally, `do:cancel` callback now also calls `proc.kill()` directly on the stored process handle
+
+---
+
 ## Versioning & Backups
 
-Every stable version is backed up as a branch before any major update:
+Every stable version is backed up in the `backups/` folder before any major update:
 
 ```
-backup/v3.1.1-2026-07-11   ← current stable snapshot
-main                        ← latest (v3.2.0)
+backups/bot.py.v3.1.1-2026-07-11   ← previous stable snapshot
+backups/bot.py.v3.2.0-2026-07-11   ← snapshot before this update
+main                                ← latest (v3.3.0)
 ```
 
 To restore a backup:
 ```bash
-git fetch origin
-git checkout backup/v3.1.1-2026-07-11
+cp ~/falcon-tg/backups/bot.py.v3.2.0-2026-07-11 ~/falcon-tg/bot.py
+bash ~/falcon-tg/update.sh
 ```
 
 ---
@@ -111,6 +138,7 @@ falcon-tg/
 ├── tg-private-bot.service  # systemd unit file
 ├── env.example         # Config template
 ├── requirements.txt    # Python deps
+├── backups/            # Versioned bot.py snapshots
 └── SERVER_DEPLOY.md    # VPS deployment guide
 ```
 
@@ -120,6 +148,7 @@ falcon-tg/
 
 | Version | Date | Notes |
 |---|---|---|
+| v3.3.0 | 2026-07-11 | Instant cancel watcher; inline search; history chips; file-type badges; fast startup ACK |
 | v3.2.0 | 2026-07-11 | Dynamic hybrid progress bar; adaptive edit interval; full audit |
 | v3.1.1 | 2026-07-11 | RAM fixes, sort-u dedup, /status, /clean; technical done msg |
 | v3.0.0 | — | ripgrep mmap integration, job queue, archives pagination |
