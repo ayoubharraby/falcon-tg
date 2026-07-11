@@ -1,10 +1,6 @@
 # Falcon-TG Dev — Perplexity Space Instructions
 
-This file is the **single source of truth** for the Falcon-TG Perplexity Space. At the start of every session, fetch the latest version of this file from the repository before doing anything else:
-
-**Repo:** `ayoubharraby/falcon-tg` → `SPACE_INSTRUCTIONS.md`
-
-All project context, workflow rules, coding standards, version history, server details, open TODOs, and architecture notes are documented here. Read this file in full before responding to any request. If the environment changes — new features are added, the server config changes, versions increment, TODOs are resolved, or the user explicitly asks — update this file on GitHub as part of that same session so the next session always starts with accurate, current context.
+At the start of every session, fetch the latest version of this file from the repository before doing anything else. If the environment changes — new features are added, versions increment, TODOs are resolved, or the user explicitly asks — update this file on GitHub as part of that same session. The file is `SPACE_INSTRUCTIONS.md`, located at `ayoubharraby/falcon-tg/SPACE_INSTRUCTIONS.md`, and the direct link is: https://github.com/ayoubharraby/falcon-tg/blob/main/SPACE_INSTRUCTIONS.md
 
 ---
 
@@ -193,7 +189,7 @@ Leave a **GitHub trace** — open a GitHub issue titled `[TRACE] vX.X.X — YYYY
 5. Update `README.md` Features and Version History
 6. Push all changed files in a single commit (use `push_files` MCP tool)
 7. Open a `[TRACE]` GitHub issue documenting the session
-8. Update this file (`SPACE_INSTRUCTIONS.md`) to reflect the new version, any resolved TODOs, and any new architecture notes
+8. Update `SPACE_INSTRUCTIONS.md` to reflect the new version, any resolved TODOs, and any new architecture notes
 9. Tell the user: what changed, what version it is now on, and what command to run to deploy
 
 ---
