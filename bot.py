@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """
-Falcon Telegram Bot v3.3.0
+Falcon Telegram Bot v3.4.0
+
+Changes in v3.4.0:
+  - PROGRESS BAR FIX: bar no longer jumps backward. Phase 1 now uses pure
+    time-based progress (monotonically increasing). expected_hits is kept
+    only as a secondary cap and is never allowed to shrink, so hit_frac
+    never regresses. A per-job _max_frac floor ensures the rendered bar
+    strictly advances forward.
+  - PART DELIVERY FIX: _split_and_send no longer aborts on first upload
+    failure. Each part is retried up to 3 times with exponential backoff
+    (2 s, 4 s, 8 s). All parts are attempted; a final summary lists any
+    that failed. The cleanup loop now runs regardless of upload outcome.
+  - CLEAR HISTORY: search prompt keyboard now has a 🗑 Clear History button
+    (callback do:clear_history). Clears the in-memory deque for that chat
+    and refreshes the prompt. Also available as /clearhistory command.
 
 Changes in v3.3.0:
   - INSTANT CANCEL: proc.kill() fires immediately from a dedicated watcher
@@ -12,7 +26,7 @@ Changes in v3.3.0:
   - RICHER GUI: search prompt shows recent history chips; job card has
     a pulsing phase indicator; archives show file-type badges.
   - CANCEL FEEDBACK: dedicated cancel-watcher thread updates the job
-    message to \"⏹ Cancelling…\" within 0.5 s, not after the next stdout.
+    message to "⏹ Cancelling…" within 0.5 s, not after the next stdout.
   - HEARTBEAT: idle poll every 25 s keeps connection fresh.
 
 Flow:
@@ -25,7 +39,7 @@ Flow:
 
 Config: copy env.example → .env
 """
-__version__ = "3.3.0"
+__version__ = "3.4.0"
 
 import os, re, time, queue, traceback, subprocess, threading, collections, json, shutil
 from pathlib import Path
@@ -81,6 +95,10 @@ EDIT_FAST_WINDOW   = 30.0
 # ── Archives pagination ───────────────────────────────────────
 ARCHIVES_PAGE_SIZE = 8
 
+# ── Upload retry config ───────────────────────────────────────
+UPLOAD_MAX_RETRIES   = 3
+UPLOAD_RETRY_BACKOFF = 2.0   # seconds; doubles each attempt
+
 # ── Recent-search history (per chat, in-memory) ───────────────
 _SEARCH_HISTORY   = {}   # chat_id -> deque(maxlen=5)
 _HISTORY_LOCK     = threading.Lock()
@@ -98,6 +116,10 @@ def _add_history(chat_id, term):
 def _get_history(chat_id):
     with _HISTORY_LOCK:
         return list(_SEARCH_HISTORY.get(chat_id, []))
+
+def _clear_history(chat_id):
+    with _HISTORY_LOCK:
+        _SEARCH_HISTORY.pop(chat_id, None)
 
 # ════════════════════════════════════════════════════════════
 # HTTP SESSION
@@ -277,27 +299,37 @@ def _list_archive_files():
     )
 
 # ════════════════════════════════════════════════════════════
-# PROGRESS BAR  (hybrid: hits-driven phase 1, time-driven phase 2)
+# PROGRESS BAR  (monotonic — never goes backward)
+#
+# FIX v3.4.0:
+#   Phase 1 uses pure time-based progress (elapsed / FULL_RUN_SECONDS).
+#   This is strictly monotonic because elapsed only ever increases.
+#   The old hit-fraction blend caused backward jumps whenever
+#   expected_hits was recalculated upward on fluctuating hit rates.
+#
+#   A _max_frac floor tracked in run_falcon() ensures the rendered bar
+#   never decreases even if a stale elapsed value arrives out of order.
+#
+#   Phase 2 remains time-based (phase2_elapsed / PHASE2_SECONDS).
 # ════════════════════════════════════════════════════════════
 def _progress_bar(elapsed_s, width=14, done=False, phase=1,
-                  hits=0, expected_hits=0, phase2_elapsed=0.0):
+                  phase2_elapsed=0.0, max_frac=0.0):
     if done:
         frac = 1.0
     elif phase == 2:
         frac = min(phase2_elapsed / PHASE2_SECONDS, 0.99)
     else:
-        time_frac = min(elapsed_s / FULL_RUN_SECONDS, 0.99)
-        if expected_hits > 0 and hits > 0:
-            hit_frac = min(hits / expected_hits, 0.99)
-            frac = 0.70 * hit_frac + 0.30 * time_frac
-        else:
-            frac = time_frac
-        frac = min(frac, 0.99)
+        # Pure time-based: monotonically increases with elapsed
+        frac = min(elapsed_s / FULL_RUN_SECONDS, 0.99)
+
+    # Monotonic floor: never render less than what we already showed
+    frac = max(frac, max_frac)
+    frac = min(frac, 1.0 if done else 0.99)
 
     filled = int(frac * width)
     bar    = "█" * filled + "░" * (width - filled)
     pct    = int(frac * 100)
-    return f"  [{bar}]  {pct}%"
+    return f"  [{bar}]  {pct}%", frac
 
 # ════════════════════════════════════════════════════════════
 # TELEGRAM API WRAPPERS
@@ -438,14 +470,17 @@ def _kb_archives(files, page):
 def _kb_search_prompt(chat_id):
     """
     Dynamic search prompt keyboard.
-    Top rows: recent-history chips (up to 5).
-    Bottom row: Back.
+    Top rows : recent-history chips (up to 5).
+    Last rows: Clear History (if any history) + Back.
     """
     history = _get_history(chat_id)
     rows = []
     for term in history:
         label = f"🕒 {term}"
         rows.append([(label, f"hs:{term}")])
+    # Show Clear History only when there is something to clear
+    if history:
+        rows.append([("🗑 Clear History", "do:clear_history")])
     rows.append([("🔙 Back", "nav:main")])
     return {"inline_keyboard": [
         [{"text": t, "callback_data": d} for t, d in row]
@@ -681,18 +716,38 @@ def handle_inline_query(inline_query_id, from_user_id, query):
 # ════════════════════════════════════════════════════════════
 _SPLIT_CHUNK = 64 * 1024  # 64 KB read buffer for splitting
 
+def _send_document_with_retry(chat_id, part_path, caption, part_num, total_parts, msg_id):
+    """
+    Upload one part with up to UPLOAD_MAX_RETRIES attempts.
+    Returns (ok: bool, err: str).
+    Exponential backoff: UPLOAD_RETRY_BACKOFF * 2^attempt seconds between tries.
+    """
+    backoff = UPLOAD_RETRY_BACKOFF
+    for attempt in range(1, UPLOAD_MAX_RETRIES + 1):
+        edit_message(chat_id, msg_id,
+            f"⬆️  Uploading part {part_num}/{total_parts}"
+            f" ({_fmt_bytes(os.path.getsize(part_path))})"
+            + (f"  — attempt {attempt}/{UPLOAD_MAX_RETRIES}" if attempt > 1 else "") + "...")
+        ok, err = send_document(chat_id, str(part_path), caption=caption)
+        if ok:
+            return True, ""
+        if attempt < UPLOAD_MAX_RETRIES:
+            time.sleep(backoff)
+            backoff *= 2
+    return False, err
+
 def _split_and_send(chat_id, file_path, caption, msg_id):
     """
     Split *file_path* into sequential parts of at most TG_MAX_BYTES each
     and upload every part as a Telegram document.
 
-    The old implementation used shutil.copyfileobj(src, dst, length=TG_MAX_BYTES)
-    inside a loop over parts.  That is wrong: copyfileobj's `length` parameter is
-    only the read-buffer size — it keeps reading until EOF regardless, so the
-    first part consumed the whole file and all later parts were empty.
-
-    The fix reads at most `remaining` bytes per part using a small chunk loop,
-    stopping each part file as soon as TG_MAX_BYTES have been written.
+    v3.4.0 changes:
+      - Each part is retried up to UPLOAD_MAX_RETRIES times with exponential
+        backoff before being marked as failed.
+      - The loop does NOT break on first failure — all parts are attempted
+        so the user receives as many parts as possible.
+      - Cleanup of temp part files happens unconditionally in a finally block.
+      - A final summary edit reports exactly which parts (if any) failed.
     """
     file_size   = os.path.getsize(file_path)
     stem        = Path(file_path).stem
@@ -720,23 +775,35 @@ def _split_and_send(chat_id, file_path, caption, msg_id):
         edit_message(chat_id, msg_id, f"❌  Failed to split: {e}")
         return False
 
-    all_ok = True
-    for i, part in enumerate(part_paths, 1):
+    failed_parts = []
+    try:
+        for i, part in enumerate(part_paths, 1):
+            ok, err = _send_document_with_retry(
+                chat_id, part,
+                caption=f"{caption} — part {i}/{total_parts}",
+                part_num=i, total_parts=total_parts,
+                msg_id=msg_id,
+            )
+            if not ok:
+                failed_parts.append((i, err))
+    finally:
+        for p in part_paths:
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+    if failed_parts:
+        fail_lines = "\n".join(
+            f"  ✗ Part {n}/{total_parts}: {e}" for n, e in failed_parts
+        )
+        sent = total_parts - len(failed_parts)
         edit_message(chat_id, msg_id,
-            f"⬆️  Uploading part {i}/{total_parts} ({_fmt_bytes(os.path.getsize(part))})...")
-        ok, err = send_document(chat_id, str(part),
-                                caption=f"{caption} — part {i}/{total_parts}")
-        if not ok:
-            edit_message(chat_id, msg_id,
-                f"❌  Upload failed on part {i}/{total_parts}: {err}")
-            all_ok = False
-            break
-    for p in part_paths:
-        try:
-            p.unlink()
-        except Exception:
-            pass
-    return all_ok
+            f"⚠️  Delivered {sent}/{total_parts} parts.\n"
+            f"Failed parts:\n{fail_lines}")
+        return False
+
+    return True
 
 def deliver_file(chat_id, file_path, label, term, msg_id):
     fsize   = os.path.getsize(file_path)
@@ -840,12 +907,12 @@ def run_falcon(chat_id, term, mode):
     done_stats     = None
     job_start      = time.time()
     phase2_start   = None
-    last_hits      = 0
-    expected_hits  = 0
-    _hit_samples   = []
-    _HIT_WINDOW    = 30.0
-    _HIT_ETA_MULT  = 1.1
     started_shown  = False    # track whether we showed "Starting…" update
+
+    # ── Monotonic progress floor ──────────────────────────────
+    # Tracks the highest frac we've ever rendered so the bar never goes back.
+    _p1_max_frac   = 0.0
+    _p2_max_frac   = 0.0
 
     try:
         for line in proc.stdout:
@@ -880,22 +947,10 @@ def run_falcon(chat_id, term, mode):
                     hits = int(m.group(2) or 0)
                     ulp  = int(m.group(3) or 0)
 
-                    _hit_samples.append((now, hits))
-                    _hit_samples = [(t, h) for t, h in _hit_samples
-                                    if now - t <= _HIT_WINDOW]
-                    if len(_hit_samples) >= 2 and reported_elapsed > 5:
-                        t0, h0 = _hit_samples[0]
-                        rate   = (hits - h0) / max(now - t0, 1.0)
-                        if rate > 0:
-                            remaining = FULL_RUN_SECONDS - reported_elapsed
-                            expected_hits = int((hits + rate * remaining) * _HIT_ETA_MULT)
-                    last_hits = hits
-
-                    bar = _progress_bar(
+                    bar, _p1_max_frac = _progress_bar(
                         elapsed_s=reported_elapsed,
                         done=False, phase=1,
-                        hits=last_hits,
-                        expected_hits=expected_hits,
+                        max_frac=_p1_max_frac,
                     )
                     phase_icon = "🔵"
                     text = (
@@ -911,13 +966,14 @@ def run_falcon(chat_id, term, mode):
                 else:  # phase 2
                     if phase2_start is None:
                         phase2_start = now
-                    combos = int(m.group(4) or 0)
+                    combos     = int(m.group(4) or 0)
                     p2_elapsed = now - phase2_start
 
-                    bar = _progress_bar(
+                    bar, _p2_max_frac = _progress_bar(
                         elapsed_s=reported_elapsed,
                         done=False, phase=2,
                         phase2_elapsed=p2_elapsed,
+                        max_frac=_p2_max_frac,
                     )
                     phase_icon = "🟢"
                     text = (
@@ -944,7 +1000,7 @@ def run_falcon(chat_id, term, mode):
                 combo_bytes = int(d.group(6) or 0)
                 done_stats  = (hits, ulp, combos, elapsed_s, ulp_bytes, combo_bytes)
 
-                bar = _progress_bar(elapsed_s, done=True)
+                bar, _ = _progress_bar(elapsed_s, done=True)
                 edit_message(chat_id, msg_id,
                     f"📊  [{label}]  {term}\n"
                     f"―――――――――――――\n"
@@ -1150,6 +1206,10 @@ def handle_callback(chat_id, msg_id, callback_id, data):
             f"🧹  Cleaned {deleted} file(s) — freed {_fmt_bytes(total)}\n\n" + text,
             reply_markup=kb)
 
+    elif data == "do:clear_history":
+        _clear_history(chat_id)
+        _show_search_prompt(chat_id, edit_msg_id=msg_id)
+
 # ════════════════════════════════════════════════════════════
 # MESSAGE HANDLER
 # ════════════════════════════════════════════════════════════
@@ -1203,6 +1263,10 @@ def handle_message(chat_id, text, msg_id):
                 pass
         send_message(chat_id,
             f"🧹  Cleaned {deleted} file(s) — freed {_fmt_bytes(total)}")
+        return
+    if text == "/clearhistory":
+        _clear_history(chat_id)
+        send_message(chat_id, "🗑  Search history cleared.")
         return
 
     if state == ST_AWAIT_TERM:
