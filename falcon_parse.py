@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """
-FALCON PARSE v4 — fast CLI credential extraction
+FALCON PARSE v4.1.0 — fast CLI credential extraction
+
+Changes in v4.1.0:
+  - LITE MODE: --mode lite --limit N  stops after N raw hits, returns
+    LITE_HITS lines to stdout (format: LITE_LINE <line>), no file written.
+  - MULTI-TERM: --terms t1,t2,t3  builds ripgrep -e flags for single-pass
+    OR search across all terms.
+  - DORK FILTERS: --dork-user, --dork-pass, --dork-domain, --dork-ext,
+    --dork-not applied as post-search Python filters before output.
 
 Usage:
   python3 falcon_parse.py --term "netflix.com" --source /data/textset --out /data/archives
-  python3 falcon_parse.py --term "@gmail.com" --source /path/to/file.txt --out ./results --mode combo
+  python3 falcon_parse.py --terms "netflix.com,hulu.com" --source /data/textset --out /data/archives --mode ulp
+  python3 falcon_parse.py --term "netflix.com" --mode lite --limit 1000 --source /data/textset --out /data/archives
+  python3 falcon_parse.py --term "netflix.com" --dork-domain netflix.com --dork-ext .com --dork-not free --source /data/textset --out /data/archives
 
-Outputs (in --out dir):
+Outputs (in --out dir, normal modes):
   ULP_{term}.txt       cleaned matched lines, deduped
   COMBO_LP_{term}.txt  clean user:pass pairs, deduped
 
@@ -14,10 +24,12 @@ Progress lines emitted to stdout (parsed by bot.py):
   PROGRESS phase=1 hits=<n> ulp=<n> elapsed=<s>
   PROGRESS phase=2 combos=<n> elapsed=<s>
   DONE hits=<n> ulp=<n> combos=<n> elapsed=<s>
+  LITE_LINE <raw_line>          (lite mode only, one per result)
+  LITE_DONE hits=<n>            (lite mode only)
 """
-__version__ = "4.0.0"
+__version__ = "4.1.0"
 
-import argparse, os, re, sys, time, shutil, subprocess, tempfile, mmap, io
+import argparse, os, re, sys, time, shutil, subprocess, tempfile, mmap, io, random
 import concurrent.futures, multiprocessing
 from pathlib import Path
 
@@ -141,28 +153,91 @@ def _slice_batch(lines):
             out.append(r)
     return out
 
+# ---------- Dork post-filters ----------
+
+def _build_dork_filter(args):
+    """
+    Returns a callable(line: str) -> bool  that applies all active dork
+    constraints.  All constraints are ANDed together.
+
+    Supported dork fields:
+      --dork-domain <val>   URL/host in the line contains <val>
+      --dork-user   <val>   username part contains <val>  (case-insensitive)
+      --dork-pass   <val>   password part contains <val>  (case-insensitive)
+      --dork-ext    <val>   user email extension is <val> e.g. .com .org
+      --dork-not    <val>   line must NOT contain <val>   (case-insensitive)
+    """
+    checks = []
+
+    if getattr(args, 'dork_domain', None):
+        dom = args.dork_domain.lower()
+        checks.append(lambda ln, d=dom: d in ln.lower())
+
+    if getattr(args, 'dork_not', None):
+        neg = args.dork_not.lower()
+        checks.append(lambda ln, n=neg: n not in ln.lower())
+
+    if getattr(args, 'dork_user', None):
+        du = args.dork_user.lower()
+        def _check_user(ln, u=du):
+            # extract user portion (first field after URL stripping)
+            pair = slice_line(ln)
+            if not pair:
+                return False
+            return u in pair.split(':', 1)[0].lower()
+        checks.append(_check_user)
+
+    if getattr(args, 'dork_pass', None):
+        dp = args.dork_pass.lower()
+        def _check_pass(ln, p=dp):
+            pair = slice_line(ln)
+            if not pair:
+                return False
+            parts = pair.split(':', 1)
+            return len(parts) == 2 and p in parts[1].lower()
+        checks.append(_check_pass)
+
+    if getattr(args, 'dork_ext', None):
+        ext = args.dork_ext.lower().lstrip('.')
+        def _check_ext(ln, e=ext):
+            pair = slice_line(ln)
+            if not pair:
+                return False
+            user = pair.split(':', 1)[0].lower()
+            # match @domain.ext or just user.ext
+            return user.endswith('.' + e) or ('@' in user and user.split('@')[-1].endswith('.' + e))
+        checks.append(_check_ext)
+
+    if not checks:
+        return None
+    def _filter(ln):
+        for c in checks:
+            if not c(ln):
+                return False
+        return True
+    return _filter
+
 # ---------- Phase 1: search ----------
 
 def rg_binary():
     return shutil.which("rg") or ""
 
-def search_with_rg(rg_exe, term, source, cpu_count):
+def search_with_rg(rg_exe, terms, source, cpu_count):
     """
-    ripgrep with:
-      --mmap          memory-mapped I/O — faster on large files
-      --no-unicode    skip Unicode segmentation — significant speedup on ASCII datasets
-      --smart-case    case-insensitive when term is lowercase
-      -j <n>          parallel threads matching CPU count
+    ripgrep with multi-term OR search via multiple -e flags.
+    --mmap, --no-unicode, --smart-case, -j <n>
     """
     cmd = [
         rg_exe,
         "--no-heading", "--no-line-number", "--no-filename",
-        "--smart-case", "-a", "-F",
+        "--smart-case", "-a",
         "--mmap",
         "--no-unicode",
         "-j", str(max(1, cpu_count)),
-        term, source,
     ]
+    for t in terms:
+        cmd += ["-e", t]
+    cmd.append(source)
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         bufsize=1 << 20, text=True, errors="ignore"
@@ -184,49 +259,42 @@ def collect_files(source):
 
 def _grep_worker(args):
     """
-    mmap-based file read — OS-level memory mapping avoids
-    Python-level buffering overhead and is significantly faster
-    than line-by-line text mode on large files.
+    mmap-based file read fallback (no ripgrep).
+    Matches if ANY of the term_bytes_list is found in the line.
     """
-    path, term_bytes = args
+    path, term_bytes_list = args
     hits = []
     try:
         with open(path, "rb") as f:
             try:
                 mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
             except (ValueError, mmap.error):
-                # empty file or unsupported — fall back
                 f.seek(0)
                 for line in f:
                     line = line.rstrip(b"\n\r")
-                    if term_bytes in line.lower():
+                    ll = line.lower()
+                    if any(t in ll for t in term_bytes_list):
                         hits.append(line.decode("utf-8", errors="ignore"))
                 return hits
-
             for line in iter(mm.readline, b""):
                 line = line.rstrip(b"\n\r")
-                if term_bytes in line.lower():
+                ll = line.lower()
+                if any(t in ll for t in term_bytes_list):
                     hits.append(line.decode("utf-8", errors="ignore"))
             mm.close()
     except Exception:
         pass
     return hits
 
-def search_pure_python(term, files, cpu_count):
-    term_bytes = term.lower().encode("utf-8", errors="ignore")
+def search_pure_python(terms, files, cpu_count):
+    term_bytes_list = [t.lower().encode("utf-8", errors="ignore") for t in terms]
     with concurrent.futures.ProcessPoolExecutor(max_workers=cpu_count) as pool:
-        for hits in pool.map(_grep_worker, [(f, term_bytes) for f in files]):
+        for hits in pool.map(_grep_worker, [(f, term_bytes_list) for f in files]):
             yield from hits
 
 # ---------- dedup via sort -u (disk-based, handles any size) ----------
 
 def sort_dedup_file(src_path, dst_path):
-    """
-    Deduplicate using GNU sort -u with:
-      --buffer-size=512M  larger in-memory sort buffer = fewer merge passes
-      --parallel=<n>      multi-core sort
-    Writes result directly to dst_path via -o (avoids /dev/stdout issues).
-    """
     cpu_count = os.cpu_count() or 4
     subprocess.run(
         ["sort", "-u",
@@ -238,52 +306,120 @@ def sort_dedup_file(src_path, dst_path):
     )
 
 def _count_lines(path):
-    """Count lines via wc -l (fast C binary)."""
     try:
         return int(subprocess.check_output(["wc", "-l", path]).split()[0])
     except Exception:
         return sum(1 for _ in open(path, errors="ignore"))
 
+# ---------- Lite mode runner ----------
+
+def run_lite(args, terms, cpu_count, line_source, dork_filter):
+    """
+    Lite mode: collect up to args.limit raw hits, apply dork filter,
+    randomly sample up to 10, emit LITE_LINE for each, then LITE_DONE.
+    No files written.
+    """
+    limit   = args.limit
+    bucket  = []
+    hits    = 0
+    t0      = time.time()
+
+    for raw in line_source:
+        cleaned = clean_raw_line(raw)
+        if not cleaned:
+            continue
+        if dork_filter and not dork_filter(cleaned):
+            continue
+        bucket.append(cleaned)
+        hits += 1
+        if hits >= limit:
+            break
+
+    # random sample up to 10
+    sample_size = min(10, len(bucket))
+    sample      = random.sample(bucket, sample_size) if sample_size > 0 else []
+
+    for line in sample:
+        print(f"LITE_LINE {line}")
+        sys.stdout.flush()
+
+    print(f"LITE_DONE hits={hits} sampled={sample_size} elapsed={time.time()-t0:.1f}")
+    sys.stdout.flush()
+
 # ---------- main ----------
 
 def main():
     ap = argparse.ArgumentParser(description=f"FALCON PARSE v{__version__}")
-    ap.add_argument("--term",   required=True)
+    # Primary term input — one of these two is required
+    ap.add_argument("--term",   default="",
+                    help="Single search term")
+    ap.add_argument("--terms",  default="",
+                    help="Comma-separated list of terms (OR search in single pass)")
     ap.add_argument("--source", required=True)
     ap.add_argument("--out",    required=True)
-    ap.add_argument("--mode",   choices=["both","ulp","combo"], default="both")
+    ap.add_argument("--mode",   choices=["both","ulp","combo","lite"], default="both")
+    ap.add_argument("--limit",  type=int, default=1000,
+                    help="Lite mode: stop after this many raw hits (default 1000)")
+    # Dork filters
+    ap.add_argument("--dork-domain", default="", dest="dork_domain",
+                    help="Filter: line must contain this domain/host")
+    ap.add_argument("--dork-user",   default="", dest="dork_user",
+                    help="Filter: username part must contain this value")
+    ap.add_argument("--dork-pass",   default="", dest="dork_pass",
+                    help="Filter: password part must contain this value")
+    ap.add_argument("--dork-ext",    default="", dest="dork_ext",
+                    help="Filter: email extension (e.g. .com .org .edu)")
+    ap.add_argument("--dork-not",    default="", dest="dork_not",
+                    help="Filter: line must NOT contain this value")
     args = ap.parse_args()
+
+    # Build terms list
+    if args.terms:
+        terms = [t.strip() for t in args.terms.split(",") if t.strip()]
+    elif args.term:
+        terms = [args.term.strip()]
+    else:
+        print("[ERR] Must provide --term or --terms")
+        sys.exit(1)
 
     cpu_count = os.cpu_count() or 4
     os.makedirs(args.out, exist_ok=True)
-    safe = re.sub(r"[^\w\-\.]", "_", args.term)
-    ulp_path   = os.path.join(args.out, f"ULP_{safe}.txt")
-    combo_path = os.path.join(args.out, f"COMBO_LP_{safe}.txt")
 
-    for p in (ulp_path, combo_path):
-        if os.path.exists(p):
-            os.remove(p)
+    # Use first term for output filename; multi-term gets joined
+    safe_name = re.sub(r"[^\w\-\.]", "_", "_".join(terms)[:60])
+    ulp_path   = os.path.join(args.out, f"ULP_{safe_name}.txt")
+    combo_path = os.path.join(args.out, f"COMBO_LP_{safe_name}.txt")
+
+    if args.mode != "lite":
+        for p in (ulp_path, combo_path):
+            if os.path.exists(p):
+                os.remove(p)
 
     print(f"[INFO] Falcon v{__version__}")
     print(f"[INFO] Source : {args.source}")
-    print(f"[INFO] Term   : {args.term}")
+    print(f"[INFO] Terms  : {', '.join(terms)}")
     print(f"[INFO] Mode   : {args.mode}")
     print(f"[INFO] CPUs   : {cpu_count}")
     sys.stdout.flush()
 
     rg_exe = rg_binary()
     files  = collect_files(args.source)
+    dork_filter = _build_dork_filter(args)
 
     if rg_exe:
-        print(f"[OK]  ripgrep: {rg_exe} (mmap + no-unicode enabled)")
-        line_source = search_with_rg(rg_exe, args.term, args.source, cpu_count)
+        print(f"[OK]  ripgrep: {rg_exe} (mmap + no-unicode + {len(terms)} term(s))")
+        line_source = search_with_rg(rg_exe, terms, args.source, cpu_count)
     else:
         print("[WARN] ripgrep not found — mmap pure-Python fallback.")
         if files is None:
             files = [str(f) for f in Path(args.source).rglob("*") if f.is_file()]
-        line_source = search_pure_python(args.term, files, cpu_count)
-
+        line_source = search_pure_python(terms, files, cpu_count)
     sys.stdout.flush()
+
+    # ── Lite mode: early exit, no files ──────────────────────
+    if args.mode == "lite":
+        run_lite(args, terms, cpu_count, line_source, dork_filter)
+        return
 
     write_ulp   = args.mode in ("both", "ulp")
     write_combo = args.mode in ("both", "combo")
@@ -296,13 +432,16 @@ def main():
     last_report = t0
 
     try:
-        # 4 MB write buffer — fewer syscalls
         with io.open(raw_tmp_path, "w", encoding="utf-8", errors="ignore", buffering=_WRITE_BUF) as raw_tmp:
             for raw in line_source:
-                hits += 1
                 cleaned = clean_raw_line(raw)
-                if cleaned:
-                    raw_tmp.write(cleaned + "\n")
+                if not cleaned:
+                    continue
+                # Apply dork filter on raw/cleaned line before writing
+                if dork_filter and not dork_filter(cleaned):
+                    continue
+                hits += 1
+                raw_tmp.write(cleaned + "\n")
                 now = time.time()
                 if now - last_report >= 1.0:
                     print(f"PROGRESS phase=1 hits={hits} ulp=0 elapsed={now-t0:.1f}")
@@ -310,7 +449,7 @@ def main():
                     last_report = now
 
         print(f"PROGRESS phase=1 hits={hits} ulp=0 elapsed={time.time()-t0:.1f}")
-        print(f"[OK]  Phase 1: {hits} raw hits in {time.time()-t0:.1f}s — deduplicating (sort {_SORT_BUF} parallel={cpu_count})...")
+        print(f"[OK]  Phase 1: {hits} raw hits in {time.time()-t0:.1f}s — deduplicating...")
         sys.stdout.flush()
 
         ulp_written = 0
@@ -327,12 +466,11 @@ def main():
             src_for_combo  = ulp_path if write_ulp else raw_tmp_path
             combo_tmp_path = os.path.join(tmp_dir, "combo_raw.txt")
 
-            print(f"[INFO] Phase 2: extracting combos from {ulp_written or hits} lines...")
+            print(f"[INFO] Phase 2: extracting combos...")
             sys.stdout.flush()
             t1 = time.time()
             last_report2 = t1
 
-            # Balanced chunk size: min 10 000, max 50 000 — avoids tiny/huge batches
             total_lines = ulp_written or hits
             chunk_size  = max(10_000, min(50_000, total_lines // max(1, cpu_count)))
 
